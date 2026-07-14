@@ -1,0 +1,22 @@
+# 환경설정·비밀값 (절대 커밋 금지)
+.env
+.env.*
+!.env.example
+
+# 런타임 상태
+logs/
+!logs/.gitkeep
+
+# 파이썬
+__pycache__/
+*.py[cod]
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# OS·에디터
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
