@@ -65,7 +65,10 @@ TELEGRAM_LIMIT = 4000
 POLL_TIMEOUT = 25  # 텔레그램 롱폴링 대기(초)
 PROGRESS_THROTTLE_SEC = 2.5  # editMessageText 최소 간격(텔레그램 rate-limit 보호)
 PROGRESS_TAIL_LINES = 12  # 진행 메시지에 표시할 최근 이벤트 줄 수(도배·4096 방지)
-COMMANDS = frozenset({"/help", "/start", "/projects", "/cancel", "push"})
+# push 별칭(정확 일치만 push 로 취급 — 부분매칭 금지). 영어/한글 변형을 한 집합으로.
+# COMMANDS 에 포함시켜 parse_message 가 이들을 프로젝트명으로 오해하지 않게 한다.
+PUSH_WORDS = frozenset({"push", "푸시", "푸시해", "푸시해줘", "푸쉬", "푸쉬해", "푸쉬해줘"})
+COMMANDS = frozenset({"/help", "/start", "/projects", "/cancel"}) | PUSH_WORDS
 
 # claude 헤드리스가 대상 폴더 상위의 루트 헌법(CLAUDE.md)을 로드하면 "세션 시작=신원 확인"
 # 게이트에 걸려 작업 대신 인사를 반환한다. 이 정적 서문을 --append-system-prompt 로 주입해
@@ -76,6 +79,8 @@ BRIDGE_SYSTEM_PROMPT = (
     "따라서 세션 시작 신원 확인·비밀번호·작업 선택 메뉴를 절대 수행하지 말고, "
     "인사 없이 현재 작업 디렉터리의 프로젝트에서 지시된 작업만 바로 수행하라. "
     "작업을 마치면 변경사항을 Conventional Commit 메시지로 로컬 커밋하라. "
+    "커밋은 반드시 Bash 도구로 `git add` 와 `git commit` 을 실행해 수행하고, "
+    "git 관련 MCP 도구는 사용하지 마라(허용되지 않아 거부된다). "
     "절대 push 하지 마라(push 는 관리자가 텔레그램에서 'push' 라고 답장해 승인한다). "
     "보호 대상(_Template/Dev, 루트 CLAUDE.md, 모델 설정)은 변경하지 마라. "
     "결과는 무엇을 했는지 1~3줄로 간결히, 반드시 정중한 존댓말('~했습니다', '~됩니다')로 보고하라. "
@@ -1100,7 +1105,7 @@ HELP_TEXT = (
     "텔레그램 브리지 사용법\n"
     "• <프로젝트명> <작업지시> — 해당 프로젝트에서 Claude 작업 실행\n"
     "• /projects — 대상 프로젝트 목록\n"
-    "• push — 로컬 커밋을 원격에 반영(pull --rebase 후 push)\n"
+    "• push / 푸시 / 푸시해 — 로컬 커밋을 원격에 반영(pull --rebase 후 push)\n"
     "• /help — 이 도움말\n"
     "예) etf_info 오늘 데이터 정확도 로그 확인해줘"
 )
@@ -1516,7 +1521,8 @@ def handle_update(
         note = "대기 중이던 선택 입력을 취소했습니다." if cleared else "취소할 작업이 없습니다."
         send_message(token, chat_id, note, secrets)
         return
-    if stripped == "push":
+    # casefold: 폰 키보드 자동 대문자화("Push")도 인식(한글 별칭엔 무영향, 영어만 대소문자 무시).
+    if stripped.casefold() in PUSH_WORDS:
         log.info("chat=%s cmd=push", chat_id)
         result = do_push(repo_root)
         send_message(token, chat_id, result, secrets)
@@ -1674,6 +1680,12 @@ def _selftest() -> None:
     assert parse_message("push") is None
     assert parse_message("solo") is None
     assert parse_message("   ") is None
+    # push 별칭: 정확 일치는 커맨드(None)로, 문장 속 부분일치는 정상 파싱돼 claude 작업으로.
+    assert PUSH_WORDS <= COMMANDS  # 모든 별칭이 COMMANDS 에 포함
+    assert all(parse_message(w) is None for w in PUSH_WORDS)  # bare 별칭은 push 커맨드
+    assert parse_message("기록해주고 푸시해줘") == ("기록해주고", "푸시해줘")  # 문장은 push 아님
+    assert "푸시해" in PUSH_WORDS and "기록해주고 푸시해줘" not in PUSH_WORDS  # 정확 일치만
+    assert "Push".casefold() in PUSH_WORDS  # 폰 자동 대문자화도 push 로(handle_update casefold)
     assert is_allowed(7, frozenset({7})) and not is_allowed(1, frozenset({7}))
     assert resolve_project("..", str(PROJECT_DIR)) is None
     assert resolve_project("../x", str(PROJECT_DIR)) is None

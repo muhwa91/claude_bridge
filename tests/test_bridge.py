@@ -110,6 +110,40 @@ def test_parse_message_projects_command_is_none():
 
 
 # ---------------------------------------------------------------------------
+# push 별칭(PUSH_WORDS): 한글 "푸시" 계열도 push 라우팅. 정확 일치만 — 문장 속은 claude 작업.
+# ---------------------------------------------------------------------------
+
+
+def test_push_words_all_in_commands():
+    # parse_message 가 별칭을 프로젝트명으로 오해하지 않도록 COMMANDS 에 포함돼야 한다.
+    assert bridge.PUSH_WORDS <= bridge.COMMANDS
+
+
+def test_parse_message_push_aliases_are_none():
+    # bare 별칭(정확 일치)은 커맨드로 인식 → None(handle_update 가 do_push 라우팅).
+    for word in bridge.PUSH_WORDS:
+        assert parse_message(word) is None
+
+
+def test_parse_message_sentence_with_push_word_still_parses():
+    # 문장 전체는 push 아님 — 정상 파싱돼 claude 작업으로 가야 한다(부분매칭 금지).
+    assert parse_message("기록해주고 푸시해줘") == ("기록해주고", "푸시해줘")
+
+
+def test_push_words_exact_match_only():
+    # 정확 일치만 push — 문장은 PUSH_WORDS 멤버가 아니다(오탐 방지 계약).
+    assert "푸시해" in bridge.PUSH_WORDS
+    assert "기록해주고 푸시해줘" not in bridge.PUSH_WORDS
+    assert "push" in bridge.PUSH_WORDS
+
+
+def test_push_word_casefold_matches_uppercase():
+    # 폰 키보드 자동 대문자화("Push"/"PUSH")도 handle_update 의 casefold 로 push 인식.
+    for variant in ("Push", "PUSH", "pUsH"):
+        assert variant.casefold() in bridge.PUSH_WORDS
+
+
+# ---------------------------------------------------------------------------
 # is_allowed(chat_id, allowed)
 # ---------------------------------------------------------------------------
 
