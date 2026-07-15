@@ -30,10 +30,9 @@ import urllib.parse
 import urllib.request
 from collections import deque
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 # ── 경로 상수 ──────────────────────────────────────────────────────────────
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -46,7 +45,9 @@ NOTIFY_STATE_FILE = LOG_DIR / "notify_state.json"
 PHOTO_DIR = LOG_DIR / "photos"
 
 # ① 시각 알림용 상수. now·요일 판정은 항상 KST 기준(스케줄 at 은 KST HH:MM).
-_KST = ZoneInfo("Asia/Seoul")
+# KST 는 서머타임이 없어 고정 오프셋 +09:00 이면 충분 — ZoneInfo(IANA tz DB) 를 피해
+# tzdata 미설치 Windows 노트북에서도 import 가 죽지 않게 한다(풀만으로 자동 실행).
+_KST = timezone(timedelta(hours=9))
 _WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 # ② 사진 대조용 상수. 다운로드 표면(크기·확장자)·REST 조회(SSRF)를 고정으로 잠근다.

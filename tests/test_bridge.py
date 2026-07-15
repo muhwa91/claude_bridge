@@ -17,7 +17,6 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import bridge
 import pytest
@@ -807,7 +806,7 @@ def test_callback_unknown_data_ignored(cb_spy, tmp_path):
 # 계약: docs/features/remote-assistant/01-계획.md "① 시각 알림" 섹션.
 # ===========================================================================
 
-_KST = ZoneInfo("Asia/Seoul")
+_KST = bridge._KST  # 고정 오프셋 +09:00(tzdata 불필요) — 프로덕션과 동일 tz 로 테스트
 # 2026-07-15 = 수요일.
 _WED_0910 = datetime(2026, 7, 15, 9, 10, tzinfo=_KST)
 _WED_0900 = datetime(2026, 7, 15, 9, 0, tzinfo=_KST)
