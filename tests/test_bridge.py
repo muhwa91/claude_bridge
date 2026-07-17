@@ -1,6 +1,6 @@
 """bridge.py 순수 함수 단위 테스트 (계약 기반).
 
-계약 출처: docs/features/telegram_bridge/01-계획.md "순수 함수 계약" 섹션.
+계약 출처: docs/기능/telegram_bridge/01_계획.md "순수 함수 계약" 섹션.
     parse_message(text) -> tuple[str, str] | None
     is_allowed(chat_id, allowed: frozenset[int]) -> bool
     resolve_project(name, target_root) -> str | None
@@ -1046,7 +1046,7 @@ def test_callback_unknown_data_ignored(cb_spy, tmp_path):
 # ===========================================================================
 # ① 시각 알림 — load_schedules / due_notifications / due_snoozes / notify_keyboard
 #   parse_callback(nb) / notify_state 왕복. 전부 순수(파일은 tmp_path).
-# 계약: docs/features/remote-assistant/01-계획.md "① 시각 알림" 섹션.
+# 계약: docs/기능/remote-assistant/01_계획.md "① 시각 알림" 섹션.
 # ===========================================================================
 
 _KST = bridge._KST  # 고정 오프셋 +09:00(tzdata 불필요) — 프로덕션과 동일 tz 로 테스트
@@ -1402,7 +1402,7 @@ def test_callback_nb_ok_no_item_falls_back(notify_env, monkeypatch, tmp_path):
 # ===========================================================================
 # ② 사진 대조 — extract_photo / valid_ticker / parse_caption_ticker / stock_url
 #   parse_stock_response / build_compare_prompt (순수) + download_file/fetch_stock
-#   (urllib monkeypatch). 계약: 01-계획.md "② 사진 대조". 실제 네트워크 없음.
+#   (urllib monkeypatch). 계약: 01_계획.md "② 사진 대조". 실제 네트워크 없음.
 # ===========================================================================
 
 
@@ -1703,7 +1703,7 @@ def test_photo_allowed_chat_triggers_handler(monkeypatch, tmp_path):
 
 # ===========================================================================
 # ③ 버튼 선택지 — parse_choice_prompt / choice_keyboard / parse_callback(c)
-#   handle_callback c 분기 · await_reply 라우팅. 계약: 01-계획.md "③ 버튼 선택지".
+#   handle_callback c 분기 · await_reply 라우팅. 계약: 01_계획.md "③ 버튼 선택지".
 # ===========================================================================
 
 
