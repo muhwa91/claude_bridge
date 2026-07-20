@@ -1,54 +1,47 @@
-"""bridge.py 순수 함수 단위 테스트 (계약 기반).
+"""bridge 코어 + 어댑터 계약 단위 테스트.
 
-계약 출처: docs/기능/telegram_bridge/01_계획.md "순수 함수 계약" 섹션.
-    parse_message(text) -> tuple[str, str] | None
-    is_allowed(chat_id, allowed: frozenset[int]) -> bool
-    resolve_project(name, target_root) -> str | None
-    chunk_text(text, limit=4096) -> list[str]
-    mask_secrets(text, secrets: list[str]) -> str
-
-표준 pytest 만 사용(내장 tmp_path 픽스처 허용). 네트워크·subprocess 호출 없음.
-bridge.py 가 병렬 구현 중이라 임포트가 실패할 수 있으나, 파일 작성이 산출물이다.
+0단계 어댑터 이관 후: 순수 함수(코어 잔류)는 bridge 에서, 플랫폼 표면(어댑터 이동분)은
+telegram_adapter 에서 import. 통합 디스패치는 정규화 `Event` + `FakeAdapter`(Adapter 계약 구현)로
+검증한다 — 네트워크·subprocess 없이 코어가 어댑터를 어떻게 호출하는지만 본다(플랫폼 무관 →
+0c 디스코드 어댑터에도 그대로 재사용). 검증 의미(동작)는 텔레그램 시절과 동일하게 보존한다.
 """
 
+import dataclasses
 import json
 import os
 import subprocess
 import sys
 import time
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 
 import bridge
 import pytest
+import telegram_adapter
+from adapter import Button, Event, _valid_id
 from bridge import (
     build_compare_prompt,
-    choice_keyboard,
-    chunk_text,
-    download_file,
+    choice_buttons,
     due_notifications,
     due_snoozes,
     event_to_progress,
-    extract_photo,
     fetch_stock,
     format_reply,
-    handle_callback,
-    handle_photo,
-    handle_update,
+    handle_event,
     is_allowed,
     load_notify_state,
     load_project_labels,
     load_schedules,
     mask_secrets,
-    notify_keyboard,
-    parse_callback,
+    notify_buttons,
     parse_caption_ticker,
     parse_choice_prompt,
     parse_message,
     parse_stock_response,
-    project_keyboard,
+    project_buttons,
     project_label,
-    push_keyboard,
+    push_buttons,
     resolve_project,
     resolve_target,
     run_claude,
@@ -56,11 +49,146 @@ from bridge import (
     stock_url,
     valid_ticker,
 )
+from telegram_adapter import (
+    TelegramAdapter,
+    chunk_text,
+    download_file,
+    encode_callback,
+    extract_photo,
+    load_offset,
+    parse_callback,
+    render_buttons,
+    save_offset,
+)
+
+_ALLOWED = frozenset({777})
+_ALLOWED2 = frozenset({777, 888})
+
+
+class FakeAdapter:
+    """Adapter 계약(secrets·poll·send·edit·ack·fetch_file·close) 구현 — 호출 기록용 테스트 더블."""
+
+    def __init__(self, secrets=None, send_ids=None, fetch=None):
+        self.secrets = secrets if secrets is not None else []
+        self.sent = []  # (channel_id, text, buttons)
+        self.notified = []  # (user_id, text, buttons) — H-1 알림 발송 타겟
+        self.edited = []  # (channel_id, message_id, text, buttons)
+        self.acked = []  # (callback_id, note)
+        self.fetched = []  # (photo_ref, dest_dir)
+        self.saves = []  # dispatch/nb 상태 저장 스파이용(테스트가 채움)
+        self.runs = []  # run_claude_with_progress 스파이용(테스트가 채움)
+        self._send_ids = iter(send_ids) if send_ids is not None else None
+        self._fetch = fetch
+
+    def poll(self):
+        return iter(())
+
+    def send(self, channel_id, text, buttons=None):
+        self.sent.append((channel_id, text, buttons))
+        if self._send_ids is not None:
+            return next(self._send_ids, None)
+        return 1
+
+    def notify(self, user_id, text, buttons=None):
+        self.notified.append((user_id, text, buttons))
+        if self._send_ids is not None:
+            return next(self._send_ids, None)
+        return 1
+
+    def edit(self, channel_id, message_id, text, buttons=None):
+        self.edited.append((channel_id, message_id, text, buttons))
+
+    def ack(self, callback_id, note=None):
+        self.acked.append((callback_id, note))
+
+    def fetch_file(self, photo_ref, dest_dir):
+        self.fetched.append((photo_ref, dest_dir))
+        if isinstance(self._fetch, BaseException):
+            raise self._fetch
+        if callable(self._fetch):
+            return self._fetch(photo_ref, dest_dir)
+        return Path(dest_dir) / "x.jpg"
+
+    def close(self):
+        pass
+
+
+def _btn(user_id, action, arg="", *, message_id=99, callback_id="cq1", channel_id=None):
+    """정규화 버튼 Event(어댑터가 parse_callback 로 만든 것과 동형)."""
+    return Event(
+        kind="button",
+        channel_id=channel_id if channel_id is not None else user_id,
+        user_id=user_id,
+        action=action,
+        action_arg=arg,
+        message_id=message_id,
+        callback_id=callback_id,
+    )
+
+
+def _txt(user_id, text, *, message_id=None, channel_id=None):
+    return Event(
+        kind="text",
+        channel_id=channel_id if channel_id is not None else user_id,
+        user_id=user_id,
+        text=text,
+        message_id=message_id,
+    )
+
+
+def _photo(user_id, caption="MU", *, photo_ref="f", channel_id=None):
+    return Event(
+        kind="photo",
+        channel_id=channel_id if channel_id is not None else user_id,
+        user_id=user_id,
+        text=caption if caption is not None else "",
+        photo_ref=photo_ref,
+    )
+
+
+def _fire(
+    adapter,
+    event,
+    allowed=_ALLOWED,
+    *,
+    repo_root=None,
+    target_root="root",
+    claude_exe="claude",
+    timeout=900,
+):
+    handle_event(
+        adapter,
+        event,
+        allowed=allowed,
+        claude_exe=claude_exe,
+        repo_root=repo_root if repo_root is not None else Path(),
+        target_root=target_root,
+        timeout=timeout,
+    )
 
 
 def _assistant(*blocks):
     """assistant 이벤트 헬퍼 — message.content 블록 리스트로 감싼다."""
     return {"type": "assistant", "message": {"content": list(blocks)}}
+
+
+# ---------------------------------------------------------------------------
+# §5.2 #1 타입 불변성: Event·Button 은 frozen dataclass (필드 변이 차단)
+# ---------------------------------------------------------------------------
+
+
+def test_event_is_frozen_dataclass():
+    ev = Event(kind="text", channel_id=1, user_id=2)
+    assert dataclasses.is_dataclass(ev)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ev.user_id = 999  # 인가 키 변조 차단(코어 신뢰 입력 불변)
+
+
+def test_button_is_frozen_dataclass():
+    b = Button("L", "push")
+    assert dataclasses.is_dataclass(b)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        b.action = "x"
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +201,6 @@ def test_parse_message_normal_two_words():
 
 
 def test_parse_message_multiword_task():
-    # 첫 토큰만 프로젝트, 나머지 전체가 지시(공백 포함 보존)
     assert parse_message("trading_info 헤더를 3행으로 정렬해줘") == (
         "trading_info",
         "헤더를 3행으로 정렬해줘",
@@ -88,7 +215,6 @@ def test_parse_message_strips_surrounding_whitespace():
 
 
 def test_parse_message_single_word_is_none():
-    # 지시 없이 프로젝트명만 → None
     assert parse_message("trading_info") is None
 
 
@@ -113,66 +239,52 @@ def test_parse_message_projects_command_is_none():
 
 
 # ---------------------------------------------------------------------------
-# push 별칭(PUSH_WORDS): 한글 "푸시" 계열도 push 라우팅. 정확 일치만 — 문장 속은 claude 작업.
+# push 별칭(PUSH_WORDS): 한글 "푸시" 계열도 push 라우팅. 정확 일치만.
 # ---------------------------------------------------------------------------
 
 
 def test_push_words_all_in_commands():
-    # parse_message 가 별칭을 프로젝트명으로 오해하지 않도록 COMMANDS 에 포함돼야 한다.
     assert bridge.PUSH_WORDS <= bridge.COMMANDS
 
 
 def test_parse_message_push_aliases_are_none():
-    # bare 별칭(정확 일치)은 커맨드로 인식 → None(handle_update 가 do_push 라우팅).
     for word in bridge.PUSH_WORDS:
         assert parse_message(word) is None
 
 
 def test_parse_message_sentence_with_push_word_still_parses():
-    # 문장 전체는 push 아님 — 정상 파싱돼 claude 작업으로 가야 한다(부분매칭 금지).
     assert parse_message("기록해주고 푸시해줘") == ("기록해주고", "푸시해줘")
 
 
 def test_push_words_exact_match_only():
-    # 정확 일치만 push — 문장은 PUSH_WORDS 멤버가 아니다(오탐 방지 계약).
     assert "푸시해" in bridge.PUSH_WORDS
     assert "기록해주고 푸시해줘" not in bridge.PUSH_WORDS
     assert "push" in bridge.PUSH_WORDS
 
 
 def test_push_word_casefold_matches_uppercase():
-    # 폰 키보드 자동 대문자화("Push"/"PUSH")도 handle_update 의 casefold 로 push 인식.
     for variant in ("Push", "PUSH", "pUsH"):
         assert variant.casefold() in bridge.PUSH_WORDS
 
 
 def _fold(s):
-    # handle_update 의 push 판정 표현식 미러 — 내부 공백 접고 casefold.
     return "".join(s.split()).casefold()
 
 
 def test_push_word_inner_space_folded():
-    # #2: 내부 공백을 접어 판정 → "푸시 해줘"·"푸시 해"·"Push "도 push(PUSH_WORDS 는 붙여쓰기 유지).
     for variant in ("푸시 해줘", "푸시 해", "푸 시", "PUSH  "):
         assert _fold(variant) in bridge.PUSH_WORDS
-    # 문장은 여전히 push 아님(오탐 방지 계약 유지).
     assert _fold("기록해주고 푸시해줘") not in bridge.PUSH_WORDS
 
 
 def test_push_inner_space_routes_to_do_push(monkeypatch, tmp_path):
-    # #2 배선: "푸시 해줘"(중간 공백)가 handle_update 에서 do_push 로 라우팅되는지.
-    calls = {"push": [], "send": []}
-
-    def fake_push(root):
-        calls["push"].append(root)
-        return bridge.HEADER_DONE
-
-    monkeypatch.setattr(bridge, "do_push", fake_push)
-    monkeypatch.setattr(bridge, "send_message", lambda *a, **_k: calls["send"].append(a))
-    handle_update(
-        _text_upd(777, "푸시 해줘"), "T", _ALLOWED, "c", tmp_path, str(tmp_path), 900, []
-    )
-    assert len(calls["push"]) == 1  # do_push 호출됨
+    # #2 배선: "푸시 해줘"(중간 공백)가 handle_event 텍스트 분기에서 do_push 로 라우팅되는지.
+    pushes = []
+    monkeypatch.setattr(bridge, "do_push", lambda root: pushes.append(root) or bridge.HEADER_DONE)
+    fa = FakeAdapter()
+    _fire(fa, _txt(777, "푸시 해줘"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert len(pushes) == 1  # do_push 호출됨
+    assert fa.sent  # 결과 회신
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +301,6 @@ def test_is_allowed_false_when_not_in_set():
 
 
 def test_is_allowed_false_when_empty_allowlist():
-    # 허용목록이 비면 아무도 통과 못 함(허용목록 제거=전면 차단, 보안 기본값)
     assert is_allowed(12345, frozenset()) is False
 
 
@@ -202,23 +313,19 @@ def test_resolve_project_exact_match_success(tmp_path):
     (tmp_path / "trading_info").mkdir()
     result = resolve_project("trading_info", str(tmp_path))
     assert result is not None
-    # 반환이 절대/상대 어느 쪽이든 실제 대상 폴더를 가리켜야 한다
     assert Path(result).name == "trading_info"
     assert Path(result).is_dir()
 
 
 def test_resolve_project_case_insensitive_unique_fallback(tmp_path):
-    # #1: 폰 첫 글자 자동 대문자화("Trading_Info") → 대소문자 무시 유일 일치면 실폴더로 해석.
-    # 반환은 사용자가 친 대문자가 아니라 실제 폴더명(trading_info)이어야 한다(오해·오탐 방지).
     (tmp_path / "trading_info").mkdir()
     result = resolve_project("Trading_Info", str(tmp_path))
     assert result is not None
-    assert Path(result).name == "trading_info"  # 실폴더명으로 구성
+    assert Path(result).name == "trading_info"
     assert Path(result).is_dir()
 
 
 def test_resolve_project_exact_match_precedence(tmp_path):
-    # #1: 정확 일치는 폴백보다 우선 — 정확히 친 이름은 그대로 해석.
     (tmp_path / "logs").mkdir()
     assert resolve_project("logs", str(tmp_path)) == str(tmp_path / "logs")
 
@@ -248,7 +355,6 @@ def test_resolve_project_backslash_rejected(tmp_path):
 
 
 def test_resolve_project_absolute_path_rejected(tmp_path):
-    # 실재하는 폴더의 절대경로라도, 폴더명 아닌 경로면 거부
     real = tmp_path / "realproj"
     real.mkdir()
     assert resolve_project(str(real), str(tmp_path)) is None
@@ -259,7 +365,7 @@ def test_resolve_project_empty_name_rejected(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# resolve_target: ④ chat 선택 고정 해석 (명시 우선 · 선택 fallback · 첫 진입/stale None)
+# resolve_target: ④ chat 선택 고정 해석
 # ---------------------------------------------------------------------------
 
 
@@ -274,17 +380,15 @@ def test_resolve_target_explicit_project_first_word(tmp_path):
 
 
 def test_resolve_target_uses_selection_when_first_word_not_project(tmp_path):
-    # (a) 버튼 선택 후 프로젝트명 없는 메시지 → 선택 프로젝트 + 메시지 전체가 task
     (tmp_path / "trading_info").mkdir()
     got = resolve_target("시간대 별로 체크하는거 각 몇시에 오지?", str(tmp_path), "trading_info")
     assert got is not None
     name, _path, task = got
     assert name == "trading_info"
-    assert task == "시간대 별로 체크하는거 각 몇시에 오지?"  # 첫 단어까지 포함한 전체
+    assert task == "시간대 별로 체크하는거 각 몇시에 오지?"
 
 
 def test_resolve_target_explicit_overrides_selection(tmp_path):
-    # (b) 프로젝트명 명시 → 명시 우선(선택이 있어도 그걸 덮어쓸 이름을 반환)
     (tmp_path / "trading_info").mkdir()
     (tmp_path / "etf_info").mkdir()
     name, path, task = resolve_target("etf_info 로그 봐줘", str(tmp_path), "trading_info")
@@ -294,18 +398,15 @@ def test_resolve_target_explicit_overrides_selection(tmp_path):
 
 
 def test_resolve_target_no_selection_no_project_none(tmp_path):
-    # (c) 선택 없고 프로젝트명 아님 → None(첫 진입 안내)
     (tmp_path / "trading_info").mkdir()
     assert resolve_target("시간대 별로 체크", str(tmp_path), None) is None
 
 
 def test_resolve_target_stale_selection_rejected(tmp_path):
-    # 선택된 폴더가 사라졌으면(resolve None) 선택 fallback 무효 → None(트래버설/무효 방어 재통과)
     assert resolve_target("작업 해줘", str(tmp_path), "gone_project") is None
 
 
 def test_resolve_target_bare_project_name_empty_task(tmp_path):
-    # 프로젝트명만(작업 없음) → 이름·경로 반환, task="" (호출측이 선택만 고정)
     (tmp_path / "trading_info").mkdir()
     name, _path, task = resolve_target("trading_info", str(tmp_path), None)
     assert name == "trading_info"
@@ -313,7 +414,6 @@ def test_resolve_target_bare_project_name_empty_task(tmp_path):
 
 
 def test_resolve_target_traversal_first_word_falls_through_to_selection(tmp_path):
-    # 첫 단어가 트래버설이면 명시 실패 → 유효 선택으로 fallback(전체 메시지 task)
     (tmp_path / "trading_info").mkdir()
     got = resolve_target("../etc 해줘", str(tmp_path), "trading_info")
     assert got is not None
@@ -323,47 +423,44 @@ def test_resolve_target_traversal_first_word_falls_through_to_selection(tmp_path
 
 
 # ---------------------------------------------------------------------------
-# chunk_text(text, limit=4096)
+# chunk_text (telegram_adapter 로 이동 — 로직 무변경)
 # ---------------------------------------------------------------------------
 
 
 def test_chunk_text_under_limit_single_chunk():
     text = "a" * 100
-    assert chunk_text(text) == [text]
+    assert chunk_text(text, 4096) == [text]
 
 
 def test_chunk_text_exactly_at_limit_single_chunk():
     text = "a" * 4096
-    chunks = chunk_text(text)
+    chunks = chunk_text(text, 4096)
     assert len(chunks) == 1
     assert chunks[0] == text
 
 
 def test_chunk_text_one_over_limit_splits_into_two():
-    # 경계 검증: 4097자 → 2개 [4096, 1]
     text = "a" * 4097
-    chunks = chunk_text(text)
+    chunks = chunk_text(text, 4096)
     assert len(chunks) == 2
     assert len(chunks[0]) == 4096
     assert len(chunks[1]) == 1
 
 
 def test_chunk_text_empty_returns_list_with_empty_string():
-    # 계약: 빈 문자열이면 [""] (빈 리스트가 아님)
-    assert chunk_text("") == [""]
+    assert chunk_text("", 4096) == [""]
 
 
 def test_chunk_text_every_chunk_within_limit():
     text = "b" * (4096 * 2 + 37)
-    chunks = chunk_text(text)
+    chunks = chunk_text(text, 4096)
     assert len(chunks) == 3
     assert all(len(c) <= 4096 for c in chunks)
 
 
 def test_chunk_text_reconstructs_original_no_data_loss():
-    # 분할이 데이터를 잃거나 중복시키지 않아야 한다
     text = "가나다" * 5000
-    assert "".join(chunk_text(text)) == text
+    assert "".join(chunk_text(text, 4096)) == text
 
 
 def test_chunk_text_custom_limit():
@@ -373,7 +470,7 @@ def test_chunk_text_custom_limit():
 
 
 # ---------------------------------------------------------------------------
-# mask_secrets(text, secrets)
+# mask_secrets (adapter 공유 유틸, bridge 재-export)
 # ---------------------------------------------------------------------------
 
 
@@ -382,12 +479,10 @@ def test_mask_secrets_single_value():
 
 
 def test_mask_secrets_multiple_values():
-    result = mask_secrets("id=42 token=xyz", ["42", "xyz"])
-    assert result == "id=*** token=***"
+    assert mask_secrets("id=42 token=xyz", ["42", "xyz"]) == "id=*** token=***"
 
 
 def test_mask_secrets_all_occurrences_replaced():
-    # 같은 비밀값이 여러 번 나오면 전부 치환
     assert mask_secrets("xyz and xyz", ["xyz"]) == "*** and ***"
 
 
@@ -396,19 +491,16 @@ def test_mask_secrets_empty_list_keeps_original():
 
 
 def test_mask_secrets_empty_secret_string_does_not_destroy_text():
-    # 빈 비밀문자열("")은 무시돼야 한다. 나이브한 str.replace("", "***")는
-    # 모든 글자 사이에 ***를 삽입해 텍스트를 파괴/폭증시킨다 → 그 버그를 잡는다.
-    result = mask_secrets("hello", ["", "ell"])
-    assert result == "h***o"
+    # 빈 비밀문자열("")은 무시돼야 한다(str.replace("", "***") 텍스트 폭증 버그 방지).
+    assert mask_secrets("hello", ["", "ell"]) == "h***o"
 
 
 def test_mask_secrets_only_empty_secret_keeps_original():
-    result = mask_secrets("hello", [""])
-    assert result == "hello"
+    assert mask_secrets("hello", [""]) == "hello"
 
 
 # ---------------------------------------------------------------------------
-# format_reply(data): claude JSON 결과 → 텔레그램 회신 텍스트 (순수 함수)
+# format_reply(data)
 # ---------------------------------------------------------------------------
 
 
@@ -416,8 +508,6 @@ def test_format_reply_success_header_no_cost():
     reply = format_reply({"result": "작업 완료", "is_error": False, "total_cost_usd": 0.05})
     assert reply.startswith("[ ✅처리완료 ]")
     assert "작업 완료" in reply
-    # 비용은 표시하지 않는다(정책). 고정 push/커밋 안내도 붙이지 않는다
-    # (실제 커밋/푸시 안내는 handle_update 가 git 상태를 조회해 덧붙임).
     assert "비용" not in reply
     assert "push" not in reply
     assert "커밋" not in reply
@@ -431,20 +521,15 @@ def test_format_reply_error_header():
 
 
 def test_format_reply_empty_result_header_only():
-    reply = format_reply({"result": "", "is_error": False})
-    assert reply == "[ ✅처리완료 ]"
-    assert "비용" not in reply
+    assert format_reply({"result": "", "is_error": False}) == "[ ✅처리완료 ]"
 
 
 def test_format_reply_error_empty_result_header_only():
-    # 실패 + 빈 result → 실패 헤더 단독
-    reply = format_reply({"result": "", "is_error": True})
-    assert reply == "[ ❌처리실패 ]"
+    assert format_reply({"result": "", "is_error": True}) == "[ ❌처리실패 ]"
 
 
 # ---------------------------------------------------------------------------
-# event_to_progress(event): stream-json 이벤트 → 진행 표시 한 줄 (순수 함수, 계약)
-# 스키마는 실제 `claude --output-format stream-json --verbose` 방출을 실측해 맞춤.
+# event_to_progress(event) (순수, 코어 잔류)
 # ---------------------------------------------------------------------------
 
 
@@ -455,8 +540,7 @@ def test_event_to_progress_text_narration():
 
 def test_event_to_progress_text_truncated_to_120():
     ev = _assistant({"type": "text", "text": "가" * 200})
-    result = event_to_progress(ev)
-    assert result == "가" * 120
+    assert event_to_progress(ev) == "가" * 120
 
 
 def test_event_to_progress_text_stripped():
@@ -465,21 +549,17 @@ def test_event_to_progress_text_stripped():
 
 
 def test_event_to_progress_masks_secret_before_truncation():
-    # L-1: 경계에서 비밀값이 쪼개져 조각이 새지 않도록, 잘라내기 전에 마스킹해야 한다.
     secret = "C:\\Users\\Home"
-    # secret 이 60자 경계에 걸치도록 배치(prefix 55 → secret 이 55~68 위치).
-    # 마스킹을 안 하면 [:60] 이 "...C:\\Us" 같은 조각을 남긴다.
     cmd = "a" * 55 + secret + "tail"
     ev = _assistant({"type": "tool_use", "name": "Bash", "input": {"command": cmd}})
     line = event_to_progress(ev, [secret])
-    assert secret not in line  # 잘린 조각도 없어야 함
-    assert "C:\\Us" not in line  # 경계에서 쪼개진 조각도 없어야 함
+    assert secret not in line
+    assert "C:\\Us" not in line
     assert "***" in line
 
 
 def test_event_to_progress_empty_text_is_none():
-    ev = _assistant({"type": "text", "text": "   "})
-    assert event_to_progress(ev) is None
+    assert event_to_progress(_assistant({"type": "text", "text": "   "})) is None
 
 
 def test_event_to_progress_read_basename_only():
@@ -513,7 +593,7 @@ def test_event_to_progress_other_tool_generic_icon():
 
 
 def test_event_to_progress_thinking_is_none():
-    ev = _assistant({"type": "thinking", "thinking": "내부 추론", "signature": "x"})
+    ev = _assistant({"type": "thinking", "thinking": "x", "signature": "y"})
     assert event_to_progress(ev) is None
 
 
@@ -543,19 +623,25 @@ def test_event_to_progress_missing_file_path_placeholder():
 
 
 def test_event_to_progress_malformed_content_is_none():
-    # message.content 가 리스트가 아니면 안전하게 None
     assert event_to_progress({"type": "assistant", "message": {"content": "oops"}}) is None
     assert event_to_progress({"type": "assistant"}) is None
 
 
+def test_event_to_progress_text_masks_secret():
+    secret = "1234567890:ABCsecrettoken"
+    ev = _assistant({"type": "text", "text": f"토큰은 {secret} 입니다"})
+    line = event_to_progress(ev, [secret])
+    assert line is not None
+    assert secret not in line
+    assert "***" in line
+
+
 # ---------------------------------------------------------------------------
-# git_status_note / do_push: _git 을 monkeypatch(pytest 내장)해 분기 검증
+# git_status_note / do_push: _git 을 monkeypatch 해 분기 검증 (코어 잔류)
 # ---------------------------------------------------------------------------
 
 
 def _fake_git(mapping):
-    """subcommand 튜플 접두어 → (returncode, stdout, stderr) 매핑으로 _git 을 대체."""
-
     def fake(_root, *args):
         for key, (rc, out, err) in mapping.items():
             if args[: len(key)] == key:
@@ -593,8 +679,7 @@ def test_git_status_note_no_ahead_dirty(monkeypatch):
         "_git",
         _fake_git({("rev-list",): (0, "0\n", ""), ("status",): (0, " M x.py\n", "")}),
     )
-    note = bridge.git_status_note(Path())
-    assert note == "변경이 있으나 커밋되지 않았습니다(확인 필요)."
+    assert bridge.git_status_note(Path()) == "변경이 있으나 커밋되지 않았습니다(확인 필요)."
 
 
 def test_git_status_note_no_ahead_clean(monkeypatch):
@@ -607,7 +692,6 @@ def test_git_status_note_no_ahead_clean(monkeypatch):
 
 
 def test_git_status_note_revlist_fail_fallback(monkeypatch):
-    # rev-list 실패 → ahead 0 안전 폴백(크래시 없이 dirty 만 반영)
     monkeypatch.setattr(
         bridge,
         "_git",
@@ -617,7 +701,6 @@ def test_git_status_note_revlist_fail_fallback(monkeypatch):
 
 
 def test_git_status_note_status_fail_fallback(monkeypatch):
-    # status 실패 → dirty False 안전 폴백
     monkeypatch.setattr(
         bridge,
         "_git",
@@ -656,12 +739,10 @@ def test_do_push_success(monkeypatch):
         "_git",
         _fake_git({("pull",): (0, "", ""), ("push",): (0, "", "")}),
     )
-    result = bridge.do_push(Path())
-    assert result.startswith(bridge.HEADER_DONE)
+    assert bridge.do_push(Path()).startswith(bridge.HEADER_DONE)
 
 
 def test_do_push_pull_uses_autostash(monkeypatch):
-    # A: pull --rebase 에 --autostash 가 포함돼야(미커밋 WIP 있어도 push 안 막히게).
     seen = []
 
     def spy(_root, *args):
@@ -675,8 +756,6 @@ def test_do_push_pull_uses_autostash(monkeypatch):
 
 
 def test_do_push_autostash_pop_conflict_isolates_and_warns(monkeypatch):
-    # #1: autostash pop 충돌(rebase rc==0, ls-files -u 비어있지 않음) → reset --hard 로
-    # 작업트리 복원 후 push 성공, 회신에 stash 경고. push "성공" 오보 + 충돌마커 잔류 회귀 방지.
     seen = []
 
     def spy(_root, *args):
@@ -687,14 +766,13 @@ def test_do_push_autostash_pop_conflict_isolates_and_warns(monkeypatch):
 
     monkeypatch.setattr(bridge, "_git", spy)
     result = bridge.do_push(Path())
-    assert result.startswith(bridge.HEADER_DONE)  # 커밋은 정상이라 push 는 진행
-    assert "stash" in result and "⚠️" in result  # 경고 명시
-    assert ("reset", "--hard", "HEAD") in seen  # 작업트리 복원(충돌마커 제거)
-    assert any(a[0] == "push" for a in seen)  # push 실제 수행
+    assert result.startswith(bridge.HEADER_DONE)
+    assert "stash" in result and "⚠️" in result
+    assert ("reset", "--hard", "HEAD") in seen
+    assert any(a[0] == "push" for a in seen)
 
 
 def test_do_push_no_pop_conflict_no_warning(monkeypatch):
-    # #1 회귀: pop 충돌 없으면(ls-files -u 비어있음) reset 없이 조용히 push 성공.
     seen = []
 
     def spy(_root, *args):
@@ -709,31 +787,32 @@ def test_do_push_no_pop_conflict_no_warning(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# project_keyboard / push_keyboard / parse_callback: 인라인 키보드 (순수 함수)
+# Button 빌더(코어) + render_buttons(어댑터): 구 특화 키보드 4종 대체
 # ---------------------------------------------------------------------------
 
 
-def test_project_keyboard_empty_no_buttons():
-    assert project_keyboard([]) == {"inline_keyboard": []}
+def test_project_buttons_empty_renders_no_buttons():
+    assert project_buttons([]) == []
+    assert render_buttons([]) == {"inline_keyboard": []}
 
 
-def test_project_keyboard_callback_data_prefix(monkeypatch):
-    # 프로덕션 JSON 비의존 — 테스트용 라벨 dict 주입으로 로직만 검증(등록 키→라벨, data=폴더명).
+def test_project_buttons_action_arg_and_render(monkeypatch):
     monkeypatch.setattr(bridge, "PROJECT_LABELS", {"demo_proj": "데모 라벨"})
-    kb = project_keyboard(["demo_proj"])
+    btns = project_buttons(["demo_proj"])
+    assert btns[0] == Button("데모 라벨", "p", "demo_proj")
+    kb = render_buttons(btns)
     btn = kb["inline_keyboard"][0][0]
     assert btn["text"] == "데모 라벨"  # 표시는 등록 라벨
     assert btn["callback_data"] == "p:demo_proj"  # 라우팅은 폴더명 그대로
 
 
 def test_project_label_registered_and_humanize(monkeypatch):
-    # 파일 로드 결과가 아니라 project_label 로직을 검증(등록 키→그 라벨 / 미등록→humanize).
     monkeypatch.setattr(bridge, "PROJECT_LABELS", {"demo_proj": "데모 라벨"})
-    assert project_label("demo_proj") == "데모 라벨"  # 등록 라벨
-    assert project_label("some_new_proj") == "some new proj"  # 미등록 → humanize
+    assert project_label("demo_proj") == "데모 라벨"
+    assert project_label("some_new_proj") == "some new proj"
     assert project_label("a-b_c") == "a b c"
-    assert project_label("") == ""  # 빈 값 안전
-    assert project_label("__") == "__"  # 구분자만 → 원문 폴백(빈 결과 방지)
+    assert project_label("") == ""
+    assert project_label("__") == "__"
 
 
 def test_load_project_labels_normal(tmp_path):
@@ -759,52 +838,90 @@ def test_load_project_labels_no_labels_key_empty(tmp_path):
 
 
 def test_load_project_labels_drops_non_str_values(tmp_path):
-    # 값이 문자열 아닌 항목은 제거(형식 방어).
     p = tmp_path / "project_labels.json"
     p.write_text('{"labels": {"ok": "라벨", "bad": 123, "list": ["x"]}}', encoding="utf-8")
     assert load_project_labels(p) == {"ok": "라벨"}
 
 
 def test_load_project_labels_bom_absorbed(tmp_path):
-    # #2: BOM(utf-8-sig) 포함 파일도 크래시 없이 정상 파싱(SSOT 깨짐 방지).
     p = tmp_path / "project_labels.json"
     p.write_text('{"labels": {"trading_info": "주식 모니터링"}}', encoding="utf-8-sig")
     assert load_project_labels(p) == {"trading_info": "주식 모니터링"}
 
 
 def test_load_project_labels_cp949_falls_back_empty(tmp_path):
-    # #2: 비-UTF8(cp949) 파일 → UnicodeDecodeError(ValueError 계열) 포착 → 크래시 없이 {}.
     p = tmp_path / "project_labels.json"
     p.write_bytes('{"labels": {"x": "한글"}}'.encode("cp949"))
     assert load_project_labels(p) == {}
 
 
-def test_project_keyboard_two_per_row():
-    kb = project_keyboard(["a", "b", "c", "d", "e"])
+def test_render_buttons_two_per_row():
+    kb = render_buttons(project_buttons(["a", "b", "c", "d", "e"]))
     rows = kb["inline_keyboard"]
-    # 2개씩 → [a,b][c,d][e]
     assert [len(r) for r in rows] == [2, 2, 1]
     assert rows[0][1]["callback_data"] == "p:b"
     assert rows[2][0]["callback_data"] == "p:e"
 
 
-def test_project_keyboard_callback_data_within_64_bytes():
-    # 초과 이름은 callback_data 만 64바이트로 절단, 표시 text 는 전체.
+def test_render_buttons_callback_data_within_64_bytes():
     long_name = "가" * 100  # 3바이트 * 100 = 300바이트
-    kb = project_keyboard([long_name])
+    kb = render_buttons(project_buttons([long_name]))
     btn = kb["inline_keyboard"][0][0]
-    assert btn["text"] == long_name
+    assert btn["text"] == long_name  # 표시는 전체
     assert len(btn["callback_data"].encode("utf-8")) <= 64
-    # 부분 멀티바이트가 깨지지 않게 잘려야 한다(디코드 가능).
-    assert btn["callback_data"].startswith("p:가")
+    assert btn["callback_data"].startswith("p:가")  # 부분 멀티바이트 안 깨짐
 
 
-def test_push_keyboard_structure():
-    kb = push_keyboard()
+def test_push_buttons_structure():
+    kb = render_buttons(push_buttons())
     row = kb["inline_keyboard"][0]
     assert [b["callback_data"] for b in row] == ["push", "x"]
     assert row[0]["text"] == "✅ Push"
     assert row[1]["text"] == "❌ 취소"
+
+
+def test_notify_buttons_callback_data():
+    kb = render_buttons(notify_buttons("ti-kospi-open"))
+    row = kb["inline_keyboard"][0]
+    assert [b["callback_data"] for b in row] == ["nb:ok:ti-kospi-open", "nb:later:ti-kospi-open"]
+
+
+def test_valid_id_prefix_budget_prevents_truncation_roundtrip():
+    # 회귀 잠금(Low): TG callback_data 64B 캡 - 최장 접두 `nb:later:`(9B) → 55 여유. _valid_id 상한
+    # 54 는 그 안쪽이라 54자 id 는 절단 없이 왕복 항등(탭 매칭 성공). 55자+ 는 방출 자체가 거부돼
+    # 절단→왕복 불일치를 원천 차단한다.
+    id54 = "a" * 54
+    assert _valid_id(id54) is True
+    cb = encode_callback("nb:later", id54)  # 최장 접두
+    assert len(cb.encode("utf-8")) <= 64  # 절단 없음
+    assert parse_callback(cb) == ("nb:later", id54)  # 왕복 항등
+    assert _valid_id("a" * 55) is False  # 초과 → 방출 거부
+
+
+def test_choice_buttons_structure():
+    kb = render_buttons(choice_buttons(77, [("유지", "keep"), ("교체", "swap")]))
+    flat = [b for row in kb["inline_keyboard"] for b in row]
+    assert flat[0]["callback_data"] == "c:77:0"
+    assert flat[1]["callback_data"] == "c:77:1"
+    assert flat[-1] == {"text": "✏️ 직접입력", "callback_data": "c:77:other"}
+
+
+def test_choice_buttons_two_per_row():
+    kb = render_buttons(choice_buttons(1, [("a", "1"), ("b", "2"), ("c", "3")]))
+    # 3 선택지 + 직접입력 = 4버튼 → 2개씩 2행.
+    assert [len(r) for r in kb["inline_keyboard"]] == [2, 2]
+
+
+def test_choice_buttons_callback_data_within_64_bytes():
+    kb = render_buttons(choice_buttons(123456, [("긴라벨" * 30, "v")]))
+    for row in kb["inline_keyboard"]:
+        for btn in row:
+            assert len(btn["callback_data"].encode("utf-8")) <= 64
+
+
+# ---------------------------------------------------------------------------
+# parse_callback / encode_callback (telegram_adapter): 콜백 프로토콜 왕복
+# ---------------------------------------------------------------------------
 
 
 def test_parse_callback_push():
@@ -829,31 +946,74 @@ def test_parse_callback_unknown_rejected():
     assert parse_callback("push extra") is None
 
 
-# ---------------------------------------------------------------------------
-# event_to_progress — text 경로 마스킹 (L-1 보강, 순수 함수)
-# ---------------------------------------------------------------------------
+def test_parse_callback_nb_ok():
+    assert parse_callback("nb:ok:ti-rollover") == ("nb:ok", "ti-rollover")
 
 
-def test_event_to_progress_text_masks_secret():
-    # L-1: assistant text 블록에 비밀값이 섞여도 잘라내기 전에 마스킹돼야 한다.
-    secret = "1234567890:ABCsecrettoken"
-    ev = _assistant({"type": "text", "text": f"토큰은 {secret} 입니다"})
-    line = event_to_progress(ev, [secret])
-    assert line is not None
-    assert secret not in line
-    assert "***" in line
+def test_parse_callback_nb_later():
+    assert parse_callback("nb:later:ti-rollover") == ("nb:later", "ti-rollover")
+
+
+def test_parse_callback_nb_empty_id_rejected():
+    assert parse_callback("nb:ok:") is None
+    assert parse_callback("nb:later:") is None
+
+
+def test_parse_callback_nb_unsafe_id_rejected():
+    assert parse_callback("nb:ok:bad/id") is None
+    assert parse_callback("nb:ok:a b") is None
+    assert parse_callback("nb:ok:" + "z" * 65) is None
+
+
+def test_parse_callback_choice_index():
+    assert parse_callback("c:55:0") == ("c", "55:0")
+    assert parse_callback("c:55:12") == ("c", "55:12")
+
+
+def test_parse_callback_choice_other():
+    assert parse_callback("c:55:other") == ("c", "55:other")
+
+
+def test_parse_callback_choice_rejects_bad():
+    assert parse_callback("c:x:1") is None
+    assert parse_callback("c:55:bad") is None
+    assert parse_callback("c:55") is None
+    assert parse_callback("c:55:1:2") is None
+
+
+def test_parse_callback_choice_rejects_unicode_digits():
+    assert parse_callback("c:" + chr(0xFF15) * 2 + ":1") is None  # 전각 숫자 msg_id
+    assert parse_callback("c:55:" + chr(0x00B2)) is None  # 위첨자 숫자 idx
+
+
+def test_encode_callback_is_inverse_of_parse():
+    # §1.3 7종: encode(디코드 결과) == 원 문자열(무손실 왕복).
+    for data in (
+        "push",
+        "x",
+        "p:etf_info",
+        "nb:ok:ti-open",
+        "nb:later:ti-roll",
+        "c:55:1",
+        "c:55:other",
+    ):
+        parsed = parse_callback(data)
+        assert parsed is not None
+        assert encode_callback(*parsed) == data
+
+
+def test_render_buttons_callback_within_tg_limit():
+    # id≤64·name≤64 라 인코드 결과가 64바이트 캡 안(TG)·100자(DC) 여유.
+    btns = [Button("L", "p", "x" * 64), Button("L", "nb:ok", "y" * 64)]
+    for row in render_buttons(btns)["inline_keyboard"]:
+        for btn in row:
+            assert len(btn["callback_data"].encode("utf-8")) <= 64
 
 
 # ===========================================================================
-# 아래는 순수 함수가 아닌 통합/보안 테스트 — subprocess·monkeypatch 사용.
-#   run_claude 스트리밍 리더(D-1/D-2/D-3) 통합 + handle_callback 인가·라우팅.
-# 디버거 재현 시나리오를 가짜 claude 실행 파일로 재현한다.
+# run_claude 스트리밍 리더(D-1/D-2/D-3) 통합 — 가짜 claude 실행 파일 (코어 잔류)
 # ===========================================================================
 
-# 가짜 claude 본체: stdin(task) 내용으로 동작을 분기해 NDJSON 을 stdout 으로 방출한다.
-#  - STDERR_FLOOD: result 전에 stderr 로 대량 출력(파이프 버퍼 포화 → 드레인 없으면 데드락)
-#  - NO_RESULT   : result 없이 stderr 에 진단 남기고 종료(폴백 경로)
-#  - HANG        : result 방출 후 stdout 을 닫지 않고 장기 sleep(손자 fd 점유 재현)
 FAKE_CLAUDE_PY = """\
 import json
 import sys
@@ -889,12 +1049,6 @@ if "HANG" in data:
 
 
 def _fake_claude(tmp_path):
-    """가짜 claude 실행 파일(shim)을 만들고 경로를 반환.
-
-    run_claude 가 claude_exe 뒤에 고정 플래그를 붙이므로, shim 은 그 인자를 무시하고
-    python 으로 fake 스크립트를 실행한다(stdin/stdout/stderr 상속). 실제 claude 도
-    Windows 에선 .CMD 배치 shim 이라 Popen 직접 실행이 동작한다(C-1 실측).
-    """
     script = tmp_path / "fake_claude.py"
     script.write_text(FAKE_CLAUDE_PY, encoding="utf-8")
     if os.name == "nt":
@@ -908,7 +1062,6 @@ def _fake_claude(tmp_path):
 
 
 def test_run_claude_normal_completion_returns_result(tmp_path):
-    # break-on-result(D-2)가 정상(비-행) 작업 완료를 깨지 않는지 — 여전히 result 반환.
     exe = _fake_claude(tmp_path)
     data = run_claude(exe, str(tmp_path), "just do it", timeout=30)
     assert data.get("result") == "DONE_FAKE"
@@ -916,20 +1069,16 @@ def test_run_claude_normal_completion_returns_result(tmp_path):
 
 
 def test_run_claude_breaks_on_result_before_timeout(tmp_path):
-    # D-2: fake 는 result 방출 후 stdout 을 닫지 않고 30초 sleep. run_claude 는
-    # 30초 타임아웃을 기다리지 않고 result 를 즉시 반환해야 한다(break-on-result).
     exe = _fake_claude(tmp_path)
     start = time.monotonic()
     data = run_claude(exe, str(tmp_path), "HANG please", timeout=30)
     elapsed = time.monotonic() - start
-    assert data.get("result") == "DONE_FAKE"  # D-3: 잔존 자식이 있어도 정상 결과 반환
+    assert data.get("result") == "DONE_FAKE"
     assert data.get("is_error") is False
-    assert elapsed < 20  # 30초 데드라인을 안 기다림(break 실패 시 ~30초 → 실패로 검출)
+    assert elapsed < 20
 
 
 def test_run_claude_stderr_flood_no_deadlock(tmp_path):
-    # D-1: result 전에 stderr 로 대량 출력(파이프 버퍼 초과). 드레인 스레드가 배수하지
-    # 않으면 자식이 stderr write 에서 블록 → result 미도달 → 거짓 타임아웃.
     exe = _fake_claude(tmp_path)
     start = time.monotonic()
     data = run_claude(exe, str(tmp_path), "STDERR_FLOOD then work", timeout=30)
@@ -939,118 +1088,102 @@ def test_run_claude_stderr_flood_no_deadlock(tmp_path):
 
 
 def test_run_claude_no_result_falls_back_to_stderr(tmp_path):
-    # D-1 폴백: result 없이 종료 시 드레인 버퍼(stderr tail)로 진단을 반환.
     exe = _fake_claude(tmp_path)
     data = run_claude(exe, str(tmp_path), "NO_RESULT crash", timeout=30)
     assert data.get("is_error") is True
     assert "fatal" in str(data.get("result", ""))
 
 
-# ---------------------------------------------------------------------------
-# handle_callback — 인라인 버튼 인가·라우팅 (네트워크·push 함수 monkeypatch)
-# ---------------------------------------------------------------------------
-
-_ALLOWED = frozenset({777})
+# ===========================================================================
+# handle_event 버튼 분기(구 handle_callback) — FakeAdapter 로 인가·라우팅 검증
+# ===========================================================================
 
 
 @pytest.fixture
-def cb_spy(monkeypatch):
-    """answer_callback·send_message·edit_message·do_push 를 스파이로 대체."""
-    calls = {"answer": [], "send": [], "edit": [], "push": []}
-
-    def fake_answer(_token, cq_id):
-        calls["answer"].append(cq_id)
-
-    def fake_send(_token, chat_id, text, _secrets, reply_markup=None):
-        calls["send"].append((chat_id, text, reply_markup))
-
-    def fake_edit(_token, chat_id, message_id, text, _secrets):
-        calls["edit"].append((chat_id, message_id, text))
-
-    def fake_push(root):
-        calls["push"].append(root)
-        return bridge.HEADER_DONE + "\n\npush ok"
-
-    monkeypatch.setattr(bridge, "answer_callback", fake_answer)
-    monkeypatch.setattr(bridge, "send_message", fake_send)
-    monkeypatch.setattr(bridge, "edit_message", fake_edit)
-    monkeypatch.setattr(bridge, "do_push", fake_push)
-    return calls
+def cb_env(monkeypatch):
+    """FakeAdapter + do_push 스파이(코어 잔류 함수만 monkeypatch)."""
+    pushes = []
+    monkeypatch.setattr(
+        bridge, "do_push", lambda root: pushes.append(root) or (bridge.HEADER_DONE + "\n\npush ok")
+    )
+    fa = FakeAdapter()
+    fa.pushes = pushes
+    return fa
 
 
-def _cq(chat_id, data, cq_id="cq1", message_id=99):
-    msg = {"chat": {"id": chat_id}}
-    if message_id is not None:
-        msg["message_id"] = message_id
-    return {"id": cq_id, "from": {"id": chat_id}, "message": msg, "data": data}
+def test_button_disallowed_user_nothing_called(cb_env, tmp_path):
+    # 미허용 user 는 허용목록 게이트에서 즉시 거부 — ack·push·send 전부 미호출.
+    _fire(cb_env, _btn(999, "push"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert cb_env.acked == [] and cb_env.sent == [] and cb_env.edited == []
+    assert cb_env.pushes == []
 
 
-def test_callback_disallowed_chat_nothing_called(cb_spy, tmp_path):
-    # HIGH: 미허용 chat 은 허용목록 게이트에서 즉시 거부 — answer·push·send 전부 미호출.
-    handle_callback(_cq(999, "push"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
-    assert cb_spy == {"answer": [], "send": [], "edit": [], "push": []}
+def test_gate_keys_on_user_id_not_channel_id(cb_env, tmp_path):
+    # §3.1 핵심 인가 전환(chat.id→user_id) 회귀 잠금 — 그룹 시나리오:
+    # channel_id 는 허용값(777)이지만 발신 user_id(999)는 비허용 → 반드시 차단.
+    # 게이트가 channel_id 로 되돌아가면(777 허용) 이 테스트가 실패한다.
+    _fire(cb_env, _btn(999, "push", channel_id=777), repo_root=tmp_path, target_root=str(tmp_path))
+    assert cb_env.pushes == [] and cb_env.acked == [] and cb_env.edited == []
 
 
-def test_callback_valid_project_sends_guide(cb_spy, tmp_path):
-    # HIGH: p:<유효> → resolve_project 통과 시 안내만 발송(push·edit 없음).
+def test_gate_allows_user_regardless_of_channel(cb_env, tmp_path):
+    # 게이트 키는 user_id 단일 — 허용 user 면 channel_id 가 허용목록에 없어도 통과.
+    _fire(
+        cb_env, _btn(777, "push", channel_id=123456), repo_root=tmp_path, target_root=str(tmp_path)
+    )
+    assert len(cb_env.pushes) == 1
+
+
+def test_button_valid_project_sends_guide(cb_env, tmp_path):
     (tmp_path / "etf_info").mkdir()
-    handle_callback(_cq(777, "p:etf_info"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
-    assert cb_spy["push"] == []
-    assert len(cb_spy["send"]) == 1
-    chat_id, text, _markup = cb_spy["send"][0]
+    _fire(cb_env, _btn(777, "p", "etf_info"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert cb_env.pushes == []
+    assert len(cb_env.sent) == 1
+    chat_id, text, _b = cb_env.sent[0]
     assert chat_id == 777
     assert "etf_info" in text
 
 
-def test_callback_invalid_project_no_send(cb_spy, tmp_path):
-    # HIGH: p:<트래버설> → resolve_project None → 무시(발송 없음).
-    handle_callback(_cq(777, "p:../secret"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
-    assert cb_spy["send"] == []
-    assert cb_spy["push"] == []
+def test_button_invalid_project_no_send(cb_env, tmp_path):
+    _fire(cb_env, _btn(777, "p", "../secret"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert cb_env.sent == []
+    assert cb_env.pushes == []
 
 
-def test_callback_push_calls_do_push_and_edits(cb_spy, tmp_path):
-    # MEDIUM: push → do_push 호출 후 결과로 원본 메시지 edit.
-    handle_callback(_cq(777, "push"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
-    assert len(cb_spy["push"]) == 1
-    assert len(cb_spy["edit"]) == 1
-    _cid, mid, text = cb_spy["edit"][0]
+def test_button_push_calls_do_push_and_edits(cb_env, tmp_path):
+    _fire(cb_env, _btn(777, "push"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert len(cb_env.pushes) == 1
+    assert len(cb_env.edited) == 1
+    _cid, mid, text, _b = cb_env.edited[0]
     assert mid == 99
     assert text.startswith(bridge.HEADER_DONE)
 
 
-def test_callback_cancel_edits_message(cb_spy, tmp_path):
-    # MEDIUM: x → "취소" 로 edit, push 없음.
-    handle_callback(_cq(777, "x"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
-    assert cb_spy["push"] == []
-    assert cb_spy["edit"][0][2] == "취소했습니다."
+def test_button_cancel_edits_message(cb_env, tmp_path):
+    _fire(cb_env, _btn(777, "x"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert cb_env.pushes == []
+    assert cb_env.edited[0][2] == "취소했습니다."
 
 
-def test_callback_push_no_message_id_send_fallback(cb_spy, tmp_path):
-    # MEDIUM: message_id 없으면 edit 대신 send 폴백.
-    handle_callback(_cq(777, "push", message_id=None), "T", _ALLOWED, tmp_path, str(tmp_path), [])
-    assert len(cb_spy["push"]) == 1
-    assert cb_spy["edit"] == []
-    assert len(cb_spy["send"]) == 1
+def test_button_push_no_message_id_send_fallback(cb_env, tmp_path):
+    _fire(cb_env, _btn(777, "push", message_id=None), repo_root=tmp_path, target_root=str(tmp_path))
+    assert len(cb_env.pushes) == 1
+    assert cb_env.edited == []
+    assert len(cb_env.sent) == 1
 
 
-def test_callback_unknown_data_ignored(cb_spy, tmp_path):
-    # MEDIUM: parse_callback None(알 수 없는 data) → 라우팅 액션 없음(스피너만 종료).
-    handle_callback(_cq(777, "bogus"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
-    assert cb_spy["send"] == []
-    assert cb_spy["edit"] == []
-    assert cb_spy["push"] == []
-    assert cb_spy["answer"] == ["cq1"]
+def test_button_unknown_action_acked_then_ignored(cb_env, tmp_path):
+    # 어댑터가 미해석 callback_data 를 action="" 로 정규화 → 코어는 ack 후 무시(라우팅 없음).
+    _fire(cb_env, _btn(777, ""), repo_root=tmp_path, target_root=str(tmp_path))
+    assert cb_env.sent == [] and cb_env.edited == [] and cb_env.pushes == []
+    assert cb_env.acked == [("cq1", None)]  # 스피너만 종료
 
 
 # ===========================================================================
-# ① 시각 알림 — load_schedules / due_notifications / due_snoozes / notify_keyboard
-#   parse_callback(nb) / notify_state 왕복. 전부 순수(파일은 tmp_path).
-# 계약: docs/기능/remote-assistant/01_계획.md "① 시각 알림" 섹션.
+# ① 시각 알림 — load_schedules / due_* / notify_state (순수, tmp_path)
 # ===========================================================================
 
-_KST = bridge._KST  # 고정 오프셋 +09:00(tzdata 불필요) — 프로덕션과 동일 tz 로 테스트
-# 2026-07-15 = 수요일.
+_KST = bridge._KST
 _WED_0910 = datetime(2026, 7, 15, 9, 10, tzinfo=_KST)
 _WED_0900 = datetime(2026, 7, 15, 9, 0, tzinfo=_KST)
 _WED_0931 = datetime(2026, 7, 15, 9, 31, tzinfo=_KST)
@@ -1075,8 +1208,7 @@ def test_load_schedules_corrupt_empty(tmp_path):
 def test_load_schedules_reads_items(tmp_path):
     p = tmp_path / "notify.json"
     p.write_text('{"items": [{"id": "a"}, "bad", {"id": "b"}]}', encoding="utf-8")
-    items = load_schedules(p)
-    assert [it["id"] for it in items] == ["a", "b"]  # dict 아닌 항목 제거
+    assert [it["id"] for it in load_schedules(p)] == ["a", "b"]
 
 
 def test_load_schedules_non_list_items_empty(tmp_path):
@@ -1094,7 +1226,6 @@ def test_due_notifications_at_window_start_inclusive():
 
 
 def test_due_notifications_at_window_end_inclusive():
-    # 09:00 + 30분 = 09:30 경계 포함, 09:31 은 밖.
     end = datetime(2026, 7, 15, 9, 30, tzinfo=_KST)
     assert due_notifications([_item()], end, set()) == [_item()]
     assert due_notifications([_item()], _WED_0931, set()) == []
@@ -1119,7 +1250,7 @@ def test_due_notifications_malformed_at_skipped():
 
 
 def test_due_notifications_missing_grace_defaults_30():
-    it = {"id": "x", "days": ["wed"], "at": "09:00"}  # grace 없음
+    it = {"id": "x", "days": ["wed"], "at": "09:00"}
     assert due_notifications([it], _WED_0910, set()) == [it]
 
 
@@ -1135,32 +1266,6 @@ def test_due_snoozes_future_not_returned():
 
 def test_due_snoozes_corrupt_iso_skipped():
     assert due_snoozes({"x": "not-a-date"}, _WED_0910) == []
-
-
-def test_notify_keyboard_callback_data():
-    kb = notify_keyboard("ti-kospi-open")
-    row = kb["inline_keyboard"][0]
-    assert [b["callback_data"] for b in row] == ["nb:ok:ti-kospi-open", "nb:later:ti-kospi-open"]
-
-
-def test_parse_callback_nb_ok():
-    assert parse_callback("nb:ok:ti-rollover") == ("nb:ok", "ti-rollover")
-
-
-def test_parse_callback_nb_later():
-    assert parse_callback("nb:later:ti-rollover") == ("nb:later", "ti-rollover")
-
-
-def test_parse_callback_nb_empty_id_rejected():
-    assert parse_callback("nb:ok:") is None
-    assert parse_callback("nb:later:") is None
-
-
-def test_parse_callback_nb_unsafe_id_rejected():
-    # charset 밖(경로·주입 방어) → None.
-    assert parse_callback("nb:ok:bad/id") is None
-    assert parse_callback("nb:ok:a b") is None
-    assert parse_callback("nb:ok:" + "z" * 65) is None
 
 
 def test_notify_state_roundtrip(tmp_path):
@@ -1181,8 +1286,8 @@ def test_notify_state_prunes_stale_date(tmp_path):
         {"fresh": "2026-07-15T09:00:00+09:00", "stale": "2026-07-14T09:00:00+09:00"},
     )
     fired, snooze = load_notify_state(p, "2026-07-15")
-    assert fired == {("today", "2026-07-15")}  # 지난 날짜 fired 제거
-    assert snooze == {"fresh": "2026-07-15T09:00:00+09:00"}  # 지난 날짜 스누즈 제거
+    assert fired == {("today", "2026-07-15")}
+    assert snooze == {"fresh": "2026-07-15T09:00:00+09:00"}
 
 
 def test_notify_state_missing_file_empty(tmp_path):
@@ -1190,8 +1295,6 @@ def test_notify_state_missing_file_empty(tmp_path):
 
 
 def test_notify_state_snooze_across_midnight_preserved(tmp_path):
-    # 🟡 fix1: 23:55 스누즈 → refire 익일 00:25. 자정 전 재로드 시 내일 refire 가 보존돼야 한다.
-    # (구현이 == today 였다면 폐기됐다. >= today 로 지난 날짜만 폐기.)
     p = tmp_path / "notify_state.json"
     save_notify_state(p, set(), {"a": "2026-07-16T00:25:00+09:00"})
     _fired, snooze = load_notify_state(p, "2026-07-15")
@@ -1199,7 +1302,6 @@ def test_notify_state_snooze_across_midnight_preserved(tmp_path):
 
 
 def test_load_schedules_rejects_unsafe_id(tmp_path):
-    # 🟢 fix3: 방출측 id 검증 대칭 — charset 위반·과길이 항목은 조용히 skip.
     p = tmp_path / "notify.json"
     p.write_text(
         '{"items": [{"id": "ok-1"}, {"id": "bad/id"}, {"id": ""}, {"id": 5}]}',
@@ -1209,19 +1311,15 @@ def test_load_schedules_rejects_unsafe_id(tmp_path):
 
 
 def test_due_snoozes_tz_naive_iso_skipped():
-    # 🟢 fix2: tz-naive ISO(상태파일 손상) → aware↔naive 비교 TypeError 를 삼키고 skip.
     assert due_snoozes({"a": "2026-07-15T09:00:00"}, _WED_0910) == []
 
 
 # ---------------------------------------------------------------------------
-# 상태변이·오케스트레이션: dispatch_notifications / handle_callback nb 분기
-#   전역 상태(notify_fired/notify_snooze) 격리 + send/edit/answer/save 스파이.
+# dispatch_notifications / handle_event nb 분기 — 전역 격리 + FakeAdapter
 # ---------------------------------------------------------------------------
 
 
 def _freeze_now(monkeypatch, fixed):
-    """bridge.datetime.now() 를 fixed 로 고정(fromisoformat 등은 실제 위임)."""
-
     class FakeDatetime(datetime):
         @classmethod
         def now(cls, *_args, **_kwargs):
@@ -1232,114 +1330,59 @@ def _freeze_now(monkeypatch, fixed):
 
 @pytest.fixture
 def notify_env(monkeypatch):
-    """알림 전역 상태 격리 + send/edit/answer/save_notify_state 스파이."""
+    """알림 전역 격리 + save_notify_state 스파이. FakeAdapter(send/edit/ack 기록)를 yield."""
     bridge.notify_fired.clear()
     bridge.notify_snooze.clear()
-    calls = {"send": [], "edit": [], "answer": [], "save": []}
-
-    def fake_send(_token, chat_id, text, _secrets, reply_markup=None):
-        calls["send"].append((chat_id, text, reply_markup))
-
-    def fake_edit(_token, chat_id, message_id, text, _secrets):
-        calls["edit"].append((chat_id, message_id, text))
-
-    def fake_answer(_token, cq_id):
-        calls["answer"].append(cq_id)
-
-    def fake_save(_path, fired, snooze):
-        calls["save"].append((set(fired), dict(snooze)))
-
-    monkeypatch.setattr(bridge, "send_message", fake_send)
-    monkeypatch.setattr(bridge, "edit_message", fake_edit)
-    monkeypatch.setattr(bridge, "answer_callback", fake_answer)
-    monkeypatch.setattr(bridge, "save_notify_state", fake_save)
-    yield calls
+    fa = FakeAdapter(secrets=[])
+    monkeypatch.setattr(
+        bridge, "save_notify_state", lambda _p, f, s: fa.saves.append((set(f), dict(s)))
+    )
+    yield fa
     bridge.notify_fired.clear()
     bridge.notify_snooze.clear()
 
 
 def test_dispatch_fans_out_to_all_allowed_and_marks_fired(notify_env, monkeypatch):
     _freeze_now(monkeypatch, _WED_0910)
-    bridge.dispatch_notifications("T", frozenset({111, 222}), [], [_item(id="a")])
-    # 허용목록 chat 전체에 팬아웃, 각 발송에 notify_keyboard 첨부
-    assert {c for c, _t, _m in notify_env["send"]} == {111, 222}
-    for _c, _t, markup in notify_env["send"]:
-        assert markup["inline_keyboard"][0][0]["callback_data"] == "nb:ok:a"
+    bridge.dispatch_notifications(notify_env, frozenset({111, 222}), [_item(id="a")])
+    # H-1: 알림은 notify(user_id) 로 발송(send 아님) — 인가목록 user_id 가 발송 타겟.
+    assert {u for u, _t, _b in notify_env.notified} == {111, 222}
+    assert notify_env.sent == []  # send 로는 발송하지 않는다(채널 오용 유실 방지)
+    for _u, _t, buttons in notify_env.notified:
+        assert buttons[0] == Button("✅ 확인시작", "nb:ok", "a")  # nb:ok:a 로 왕복
     assert ("a", "2026-07-15") in bridge.notify_fired
-    assert len(notify_env["save"]) == 1
+    assert len(notify_env.saves) == 1
 
 
 def test_dispatch_snooze_refires_then_pops(notify_env, monkeypatch):
-    _freeze_now(monkeypatch, _WED_0931)  # 스케줄 창 밖 → due 아님, 스누즈만 발송
+    _freeze_now(monkeypatch, _WED_0931)  # 창 밖 → due 아님, 스누즈만 발송
     bridge.notify_fired.add(("a", "2026-07-15"))
-    bridge.notify_snooze["a"] = datetime(2026, 7, 15, 9, 20, tzinfo=_KST).isoformat()  # 지남
-    bridge.dispatch_notifications("T", frozenset({111}), [], [_item(id="a")])
-    assert len(notify_env["send"]) == 1
-    assert "a" not in bridge.notify_snooze  # 발송 후 pop(1회성)
+    bridge.notify_snooze["a"] = datetime(2026, 7, 15, 9, 20, tzinfo=_KST).isoformat()
+    bridge.dispatch_notifications(notify_env, frozenset({111}), [_item(id="a")])
+    assert len(notify_env.notified) == 1
+    assert "a" not in bridge.notify_snooze
 
 
 def test_dispatch_due_and_snooze_no_double_send(notify_env, monkeypatch):
-    _freeze_now(monkeypatch, _WED_0910)  # 창 안 → due 이면서 스누즈도 지남
+    _freeze_now(monkeypatch, _WED_0910)
     bridge.notify_snooze["a"] = datetime(2026, 7, 15, 9, 0, tzinfo=_KST).isoformat()
-    bridge.dispatch_notifications("T", frozenset({111}), [], [_item(id="a")])
-    assert len(notify_env["send"]) == 1  # 병합 시 한 번만
+    bridge.dispatch_notifications(notify_env, frozenset({111}), [_item(id="a")])
+    assert len(notify_env.notified) == 1  # 병합 시 한 번만
 
 
-@pytest.mark.usefixtures("notify_env")
-def test_dispatch_prunes_stale_date(monkeypatch):
+def test_dispatch_prunes_stale_date(monkeypatch, notify_env):
     _freeze_now(monkeypatch, datetime(2026, 7, 15, 3, 0, tzinfo=_KST))
     bridge.notify_fired.add(("old", "2026-07-14"))
-    bridge.dispatch_notifications("T", frozenset({111}), [], [])
-    assert ("old", "2026-07-14") not in bridge.notify_fired  # 날짜 롤오버 정리
+    bridge.dispatch_notifications(notify_env, frozenset({111}), [])
+    assert ("old", "2026-07-14") not in bridge.notify_fired
 
 
 def test_dispatch_no_targets_no_send(notify_env, monkeypatch):
-    _freeze_now(monkeypatch, _WED_0931)  # 창 밖·스누즈 없음
-    bridge.dispatch_notifications("T", frozenset({111}), [], [_item(id="a")])
-    assert notify_env["send"] == []
-    assert notify_env["save"] == []
-
-
-def test_callback_nb_ok_edits_and_clears_snooze(notify_env, monkeypatch, tmp_path):
-    _write_schedules(monkeypatch, tmp_path, [])  # 프로덕션 notify.json 비의존(항목 없음 폴백)
-    bridge.notify_snooze["a"] = "2026-07-15T09:00:00+09:00"
-    handle_callback(_cq(777, "nb:ok:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
-    assert notify_env["edit"][0][2].startswith("✅")  # 확인 접수·버튼 제거
-    assert "a" not in bridge.notify_snooze
-    assert len(notify_env["save"]) == 1  # 스누즈 변화 → save
-
-
-def test_callback_nb_ok_without_snooze_no_save(notify_env, monkeypatch, tmp_path):
-    _write_schedules(monkeypatch, tmp_path, [])  # 프로덕션 notify.json 비의존
-    handle_callback(_cq(777, "nb:ok:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
-    assert notify_env["edit"][0][2].startswith("✅")
-    assert notify_env["save"] == []  # 변화 없으면 불필요한 IO 없음
-
-
-def test_callback_nb_later_snoozes_and_saves(notify_env, monkeypatch, tmp_path):
-    _freeze_now(monkeypatch, _WED_0910)  # 09:10 → +30분 = 09:40
-    handle_callback(_cq(777, "nb:later:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
-    assert bridge.notify_snooze["a"].startswith("2026-07-15T09:40")
-    assert len(notify_env["save"]) == 1
-    assert notify_env["edit"][0][2].startswith("⏰")  # "30분 뒤" 안내·버튼 제거
-
-
-def test_callback_nb_disallowed_chat_ignored(notify_env, tmp_path):
-    # 보안: 미허용 chat 은 nb 분기도 게이트에서 즉시 거부.
-    handle_callback(_cq(999, "nb:later:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
-    assert notify_env["edit"] == []
-    assert notify_env["save"] == []
-    assert bridge.notify_snooze == {}
-
-
-# --- nb:ok = 실제 예약 점검 실행 (build_notify_check_prompt · 항목 조회 라우팅) ---
-
-
-def test_build_notify_check_prompt_contents():
-    p = bridge.build_notify_check_prompt("코스피 개장", "야간선물→코스피 전환 확인")
-    assert "코스피 개장" in p and "야간선물→코스피 전환 확인" in p
-    assert "점검" in p and "제안" in p  # 점검·제안(자동수정 금지)
-    assert "수정·커밋은 하지 마라" in p  # 안전핀
+    _freeze_now(monkeypatch, _WED_0931)
+    bridge.dispatch_notifications(notify_env, frozenset({111}), [_item(id="a")])
+    assert notify_env.notified == []
+    assert notify_env.sent == []
+    assert notify_env.saves == []
 
 
 def _write_schedules(monkeypatch, tmp_path, items):
@@ -1348,8 +1391,45 @@ def _write_schedules(monkeypatch, tmp_path, items):
     monkeypatch.setattr(bridge, "SCHEDULES_FILE", p)
 
 
-def test_callback_nb_ok_runs_check_when_item_found(notify_env, monkeypatch, tmp_path):
-    # 항목 있음 + 프로젝트 해석됨 → run_claude_with_progress 실행(점검 프롬프트·해석된 경로).
+def test_button_nb_ok_edits_and_clears_snooze(notify_env, monkeypatch, tmp_path):
+    _write_schedules(monkeypatch, tmp_path, [])
+    bridge.notify_snooze["a"] = "2026-07-15T09:00:00+09:00"
+    _fire(notify_env, _btn(777, "nb:ok", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert notify_env.edited[0][2].startswith("✅")
+    assert "a" not in bridge.notify_snooze
+    assert len(notify_env.saves) == 1
+
+
+def test_button_nb_ok_without_snooze_no_save(notify_env, monkeypatch, tmp_path):
+    _write_schedules(monkeypatch, tmp_path, [])
+    _fire(notify_env, _btn(777, "nb:ok", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert notify_env.edited[0][2].startswith("✅")
+    assert notify_env.saves == []
+
+
+def test_button_nb_later_snoozes_and_saves(notify_env, monkeypatch, tmp_path):
+    _freeze_now(monkeypatch, _WED_0910)  # 09:10 → +30분 = 09:40
+    _fire(notify_env, _btn(777, "nb:later", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert bridge.notify_snooze["a"].startswith("2026-07-15T09:40")
+    assert len(notify_env.saves) == 1
+    assert notify_env.edited[0][2].startswith("⏰")
+
+
+def test_button_nb_disallowed_user_ignored(notify_env, tmp_path):
+    _fire(notify_env, _btn(999, "nb:later", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert notify_env.edited == []
+    assert notify_env.saves == []
+    assert bridge.notify_snooze == {}
+
+
+def test_build_notify_check_prompt_contents():
+    p = bridge.build_notify_check_prompt("코스피 개장", "야간선물→코스피 전환 확인")
+    assert "코스피 개장" in p and "야간선물→코스피 전환 확인" in p
+    assert "점검" in p and "제안" in p
+    assert "수정·커밋은 하지 마라" in p
+
+
+def test_button_nb_ok_runs_check_when_item_found(notify_env, monkeypatch, tmp_path):
     (tmp_path / "trading_info").mkdir()
     _write_schedules(
         monkeypatch,
@@ -1358,51 +1438,44 @@ def test_callback_nb_ok_runs_check_when_item_found(notify_env, monkeypatch, tmp_
     )
     runs = []
 
-    def spy(_t, cid, _hdr, _exe, proj, task, _to, _sec, allowed_tools=None, **_k):
+    def spy(_a, cid, _hdr, _exe, proj, task, _to, allowed_tools=None, **_k):
         runs.append((cid, proj, task, allowed_tools))
 
     monkeypatch.setattr(bridge, "run_claude_with_progress", spy)
-    handle_callback(_cq(777, "nb:ok:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
+    _fire(notify_env, _btn(777, "nb:ok", "a"), repo_root=tmp_path, target_root=str(tmp_path))
     assert len(runs) == 1
     cid, proj, task, allowed_tools = runs[0]
     assert cid == 777 and proj == str(tmp_path / "trading_info")
-    assert "코스피 개장" in task and "개장 확인" in task  # 점검 프롬프트
-    # 읽기/검증 전용 도구셋 하드 강제: Read 포함, Edit/Write/commit 미포함.
+    assert "코스피 개장" in task and "개장 확인" in task
     assert allowed_tools == bridge.NOTIFY_CHECK_TOOLS
     assert "Read" in allowed_tools
     assert "Edit" not in allowed_tools and "Write" not in allowed_tools
     assert not any("commit" in t for t in allowed_tools)
-    assert any("확인 실행 중" in t for _c, _m, t in notify_env["edit"])
+    assert any("확인 실행 중" in t for _c, _m, t, _b in notify_env.edited)
 
 
-def test_callback_nb_ok_project_unresolved_errors(notify_env, monkeypatch, tmp_path):
-    # 항목 있음 + 프로젝트 폴더 없음 → 실행 안 함·에러 안내.
+def test_button_nb_ok_project_unresolved_errors(notify_env, monkeypatch, tmp_path):
     _write_schedules(
         monkeypatch, tmp_path, [{"id": "a", "project": "gone_proj", "note": "확인", "label": "L"}]
     )
     runs = []
-    monkeypatch.setattr(
-        bridge, "run_claude_with_progress", lambda *_a, **_k: runs.append(1)
-    )
-    handle_callback(_cq(777, "nb:ok:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
-    assert runs == []  # 실행 안 됨
-    assert any("찾지 못해" in t for _c, _m, t in notify_env["edit"])
+    monkeypatch.setattr(bridge, "run_claude_with_progress", lambda *_a, **_k: runs.append(1))
+    _fire(notify_env, _btn(777, "nb:ok", "a"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert runs == []
+    assert any("찾지 못해" in t for _c, _m, t, _b in notify_env.edited)
 
 
-def test_callback_nb_ok_no_item_falls_back(notify_env, monkeypatch, tmp_path):
-    # 매칭 항목 없음 → 구 stub 접수 문구 폴백(실행 없음).
+def test_button_nb_ok_no_item_falls_back(notify_env, monkeypatch, tmp_path):
     _write_schedules(monkeypatch, tmp_path, [{"id": "other", "project": "x", "note": "n"}])
     runs = []
     monkeypatch.setattr(bridge, "run_claude_with_progress", lambda *_a, **_k: runs.append(1))
-    handle_callback(_cq(777, "nb:ok:a"), "T", _ALLOWED, tmp_path, str(tmp_path), [])
+    _fire(notify_env, _btn(777, "nb:ok", "a"), repo_root=tmp_path, target_root=str(tmp_path))
     assert runs == []
-    assert any("확인을 시작합니다" in t for _c, _m, t in notify_env["edit"])
+    assert any("확인을 시작합니다" in t for _c, _m, t, _b in notify_env.edited)
 
 
 # ===========================================================================
-# ② 사진 대조 — extract_photo / valid_ticker / parse_caption_ticker / stock_url
-#   parse_stock_response / build_compare_prompt (순수) + download_file/fetch_stock
-#   (urllib monkeypatch). 계약: 01_계획.md "② 사진 대조". 실제 네트워크 없음.
+# ② 사진 대조 — 순수 함수 + download_file/fetch_stock + handle_event 사진 분기
 # ===========================================================================
 
 
@@ -1420,7 +1493,6 @@ def test_extract_photo_picks_max_resolution():
 
 
 def test_extract_photo_unordered_still_max():
-    # 오름차순 가정에 의존하지 않는다 — 큰 것이 배열 앞에 와도 선택.
     upd = {
         "message": {
             "photo": [
@@ -1459,7 +1531,7 @@ def test_valid_ticker_rejects_ssrf_and_traversal():
 
 def test_parse_caption_ticker_extracts_first_valid():
     assert parse_caption_ticker("trading_info MU 대조") == "MU"
-    assert parse_caption_ticker("mu") == "MU"  # 대문자화
+    assert parse_caption_ticker("mu") == "MU"
     assert parse_caption_ticker("NQ=F 확인해줘") == "NQ=F"
 
 
@@ -1495,7 +1567,6 @@ def test_parse_stock_response_full():
 
 
 def test_parse_stock_response_missing_fields_none():
-    # change_percent 는 현재가 없을 때 응답에서 빠질 수 있다 → None 안전.
     out = parse_stock_response({"session": "프리마켓"})
     assert out["change_percent"] is None
     assert out["change_amount"] is None
@@ -1507,10 +1578,10 @@ def test_build_compare_prompt_contains_values_and_no_commit():
     assert "MU" in prompt
     assert "-3.1" in prompt
     assert "x.jpg" in prompt
-    assert "커밋은 하지" in prompt  # 되확인 안전핀(③ 전 폴백)
+    assert "커밋은 하지" in prompt
 
 
-# --- download_file / fetch_stock: urllib monkeypatch(실제 네트워크 없음) ---
+# --- download_file / fetch_stock: urllib monkeypatch (telegram_adapter) ---
 
 
 class _FakeResp:
@@ -1529,19 +1600,21 @@ class _FakeResp:
 
 
 def _patch_urlopen(monkeypatch, resp):
+    # fetch_stock=urlopen, download_file=리다이렉트 차단 opener(_NOREDIRECT_OPENER.open).
+    # 둘 다 같은 가짜 resp 로 패치해 기존 검증 의미를 보존(M-3 opener 도입 후).
     monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_k: resp)
+    monkeypatch.setattr(telegram_adapter._NOREDIRECT_OPENER, "open", lambda *_a, **_k: resp)
 
 
 def test_download_file_writes_basename_only(monkeypatch, tmp_path):
     _patch_urlopen(monkeypatch, _FakeResp(b"\xff\xd8jpegdata"))
     dest = download_file("TOKEN", "photos/file_99.jpg", tmp_path)
     assert dest.name == "file_99.jpg"
-    assert dest.parent == tmp_path  # 경로 성분 제거(트래버설 차단)
+    assert dest.parent == tmp_path
     assert dest.read_bytes() == b"\xff\xd8jpegdata"
 
 
 def test_download_file_traversal_path_stays_in_dest(monkeypatch, tmp_path):
-    # file_path 에 상위 이동이 있어도 basename 만 → dest_dir 밖으로 못 나감.
     _patch_urlopen(monkeypatch, _FakeResp(b"x"))
     dest = download_file("T", "a/../../evil.png", tmp_path)
     assert dest.name == "evil.png"
@@ -1555,17 +1628,54 @@ def test_download_file_rejects_bad_extension(monkeypatch, tmp_path):
 
 
 def test_download_file_rejects_oversize_body(monkeypatch, tmp_path):
-    monkeypatch.setattr(bridge, "MAX_PHOTO_BYTES", 4)
+    monkeypatch.setattr(telegram_adapter, "MAX_PHOTO_BYTES", 4)
     _patch_urlopen(monkeypatch, _FakeResp(b"toolongbody"))
     with pytest.raises(ValueError, match=r"10MB|상한"):
         download_file("T", "photos/x.jpg", tmp_path)
 
 
 def test_download_file_rejects_oversize_content_length(monkeypatch, tmp_path):
-    monkeypatch.setattr(bridge, "MAX_PHOTO_BYTES", 4)
+    monkeypatch.setattr(telegram_adapter, "MAX_PHOTO_BYTES", 4)
     _patch_urlopen(monkeypatch, _FakeResp(b"ok", headers={"Content-Length": "999"}))
     with pytest.raises(ValueError, match=r"10MB|상한"):
         download_file("T", "photos/x.jpg", tmp_path)
+
+
+def test_noredirect_handler_blocks_3xx():
+    # M-3: redirect_request→None → urllib 이 3xx 를 HTTPError 로 승격(추종 안 함).
+    h = telegram_adapter._NoRedirectHandler()
+    internal = "http://169.254.169.254/latest/"
+    assert h.redirect_request(None, None, 302, "Found", {}, internal) is None
+
+
+def _raise_302(*_a, **_k):
+    raise urllib.error.HTTPError(
+        "https://api.telegram.org/file/botT/photos/x.jpg",
+        302,
+        "redirect blocked",
+        {},  # type: ignore[arg-type]
+        None,
+    )
+
+
+def test_download_file_rejects_redirect(monkeypatch, tmp_path):
+    # M-3: 화이트리스트 호스트가 내부주소로 3xx → opener 가 추종 대신 HTTPError → 다운로드 거부.
+    monkeypatch.setattr(telegram_adapter._NOREDIRECT_OPENER, "open", _raise_302)
+    with pytest.raises(urllib.error.HTTPError):
+        download_file("T", "photos/x.jpg", tmp_path)
+
+
+def test_download_file_uses_noredirect_opener_not_urlopen(monkeypatch, tmp_path):
+    # M-3: download_file 은 리다이렉트 차단 opener 를 쓴다 — 소박한 urlopen(추종)이면 실패해야.
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("urlopen 직접 호출 금지")),
+    )
+    monkeypatch.setattr(
+        telegram_adapter._NOREDIRECT_OPENER, "open", lambda *_a, **_k: _FakeResp(b"\xff\xd8ok")
+    )
+    dest = download_file("T", "photos/x.jpg", tmp_path)
+    assert dest.read_bytes() == b"\xff\xd8ok"
 
 
 def test_fetch_stock_parses_response(monkeypatch):
@@ -1577,7 +1687,6 @@ def test_fetch_stock_parses_response(monkeypatch):
 
 
 def test_fetch_stock_rejects_invalid_ticker_before_network(monkeypatch):
-    # SSRF: 무효 ticker 는 URL 조립 단계(stock_url)에서 차단 — 네트워크 도달 전.
     called = {"n": 0}
 
     def boom(*_a, **_k):
@@ -1590,120 +1699,109 @@ def test_fetch_stock_rejects_invalid_ticker_before_network(monkeypatch):
     assert called["n"] == 0
 
 
-# --- handle_photo 오케스트레이션 (download/REST/run 스파이) + 게이트 대칭 ---
-
-
-def _photo_upd(chat_id, caption="MU", with_photo=True):
-    msg = {"chat": {"id": chat_id}}
-    if caption is not None:
-        msg["caption"] = caption
-    if with_photo:
-        msg["photo"] = [{"file_id": "f", "width": 100, "height": 100}]
-    return {"message": msg}
+# --- handle_event 사진 분기 오케스트레이션 (FakeAdapter.fetch_file + fetch_stock 스파이) ---
 
 
 @pytest.fixture
-def photo_spy(monkeypatch):
-    """send/run_claude_with_progress/tg_get_file/download_file/fetch_stock 를 해피패스 스파이로."""
-    calls = {"send": [], "run": [], "getfile": 0, "download": 0, "fetch": 0}
+def photo_env(monkeypatch):
+    """run_claude_with_progress / fetch_stock 스파이 + FakeAdapter(fetch_file 기록)."""
+    fa = FakeAdapter(secrets=[])
 
-    def fake_send(_t, chat_id, text, _s, _reply_markup=None):
-        calls["send"].append((chat_id, text))
-
-    def fake_run(*args):  # (token, chat_id, header, exe, proj, task, timeout, secrets, allowed)
-        calls["run"].append({"allowed_tools": args[8] if len(args) > 8 else None})
+    def fake_run(*args, **_k):
+        # (adapter, channel_id, header, exe, proj, task, timeout, allowed_tools?)
+        fa.runs.append({"allowed_tools": args[7] if len(args) > 7 else None})
         return {"result": "✅ 일치", "is_error": False}
 
-    def fake_getfile(_t, _fid):
-        calls["getfile"] += 1
-        return "photos/x.jpg"
-
-    def fake_download(_t, _fp, dest_dir):
-        calls["download"] += 1
-        return dest_dir / "x.jpg"  # 존재하지 않아도 unlink(missing_ok=True) 안전
-
-    def fake_fetch(_ticker):
-        calls["fetch"] += 1
-        return {"change_percent": -3.1, "session": "정규장"}
-
-    monkeypatch.setattr(bridge, "send_message", fake_send)
     monkeypatch.setattr(bridge, "run_claude_with_progress", fake_run)
-    monkeypatch.setattr(bridge, "tg_get_file", fake_getfile)
-    monkeypatch.setattr(bridge, "download_file", fake_download)
-    monkeypatch.setattr(bridge, "fetch_stock", fake_fetch)
-    return calls
+    monkeypatch.setattr(
+        bridge, "fetch_stock", lambda _t: {"change_percent": -3.1, "session": "정규장"}
+    )
+    return fa
 
 
-def test_photo_no_caption_prompts_no_run(photo_spy, tmp_path):
+def test_photo_no_caption_prompts_no_run(photo_env, tmp_path):
     (tmp_path / "trading_info").mkdir()
-    handle_photo(_photo_upd(777, caption=None), 777, "T", "c", str(tmp_path), 60, [])
-    assert photo_spy["run"] == []  # claude 미호출
-    assert any("캡션" in t for _c, t in photo_spy["send"])
+    _fire(photo_env, _photo(777, caption=None), repo_root=tmp_path, target_root=str(tmp_path))
+    assert photo_env.runs == []
+    assert any("캡션" in t for _c, t, _b in photo_env.sent)
 
 
-def test_photo_no_photo_size_prompts_no_run(photo_spy, tmp_path):
+def test_photo_no_photo_ref_prompts_no_run(photo_env, tmp_path):
     (tmp_path / "trading_info").mkdir()
-    upd = _photo_upd(777, caption="MU", with_photo=False)
-    handle_photo(upd, 777, "T", "c", str(tmp_path), 60, [])
-    assert photo_spy["run"] == []
-    assert any("사진을 읽지" in t for _c, t in photo_spy["send"])
+    _fire(
+        photo_env,
+        _photo(777, caption="MU", photo_ref=None),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert photo_env.runs == []
+    assert any("사진을 읽지" in t for _c, t, _b in photo_env.sent)
 
 
-def test_photo_download_fail_graceful(photo_spy, monkeypatch, tmp_path):
+def test_photo_download_fail_graceful(monkeypatch, tmp_path):
     (tmp_path / "trading_info").mkdir()
-
-    def boom(*_a):
-        raise OSError("net down")
-
-    monkeypatch.setattr(bridge, "tg_get_file", boom)
-    handle_photo(_photo_upd(777), 777, "T", "c", str(tmp_path), 60, [])
-    assert photo_spy["run"] == []
-    assert any("내려받지" in t for _c, t in photo_spy["send"])
+    fa = FakeAdapter(secrets=[], fetch=OSError("net down"))
+    monkeypatch.setattr(bridge, "run_claude_with_progress", lambda *_a, **_k: fa.runs.append(1))
+    monkeypatch.setattr(bridge, "fetch_stock", lambda _t: {})
+    _fire(fa, _photo(777, caption="MU"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert fa.runs == []
+    assert any("내려받지" in t for _c, t, _b in fa.sent)
 
 
-def test_photo_rest_fail_graceful(photo_spy, monkeypatch, tmp_path):
+def test_photo_rest_fail_graceful(photo_env, monkeypatch, tmp_path):
     (tmp_path / "trading_info").mkdir()
 
     def boom(_t):
-        raise OSError("conn refused")  # 서버(:8000) 미기동 상황
+        raise OSError("conn refused")
 
     monkeypatch.setattr(bridge, "fetch_stock", boom)
-    handle_photo(_photo_upd(777), 777, "T", "c", str(tmp_path), 60, [])
-    assert photo_spy["run"] == []
-    assert any("REST 응답 없음" in t for _c, t in photo_spy["send"])
+    _fire(photo_env, _photo(777, caption="MU"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert photo_env.runs == []
+    assert any("REST 응답 없음" in t for _c, t, _b in photo_env.sent)
 
 
-def test_photo_normal_runs_with_read_only_tools(photo_spy, tmp_path):
+def test_photo_normal_runs_with_read_only_tools(photo_env, tmp_path):
     # M-1 회귀 잠금: 사진 대조 run 은 반드시 Read 전용 도구셋으로 호출.
     (tmp_path / "trading_info").mkdir()
-    handle_photo(
-        _photo_upd(777, caption="trading_info MU 대조"), 777, "T", "c", str(tmp_path), 60, []
+    _fire(
+        photo_env,
+        _photo(777, caption="trading_info MU 대조"),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
     )
-    assert len(photo_spy["run"]) == 1
-    assert photo_spy["run"][0]["allowed_tools"] == ["Read"]
-    assert photo_spy["fetch"] == 1
+    assert len(photo_env.runs) == 1
+    assert photo_env.runs[0]["allowed_tools"] == ["Read"]
+    assert photo_env.fetched  # 사진 다운로드 시도됨
 
 
-def test_photo_disallowed_chat_never_downloads(monkeypatch, tmp_path):
-    # 보안 회귀 잠금: 미허용 chat 의 사진은 handle_update 게이트에서 차단 → handle_photo 미도달.
-    reached = []
-    monkeypatch.setattr(bridge, "handle_photo", lambda *_a, **_k: reached.append(1))
-    monkeypatch.setattr(bridge, "send_message", lambda *_a, **_k: None)
-    handle_update(_photo_upd(999), "T", frozenset({777}), "c", tmp_path, str(tmp_path), 60, [])
-    assert reached == []
+def test_photo_disallowed_user_never_downloads(tmp_path):
+    # 보안 회귀 잠금: 미허용 user 는 게이트에서 차단 → fetch_file 미도달.
+    fa = FakeAdapter(secrets=[])
+    _fire(
+        fa,
+        _photo(999, caption="MU"),
+        allowed=frozenset({777}),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert fa.fetched == []
+    assert fa.sent == []
 
 
-def test_photo_allowed_chat_triggers_handler(monkeypatch, tmp_path):
-    reached = []
-    monkeypatch.setattr(bridge, "handle_photo", lambda *_a, **_k: reached.append(1))
-    monkeypatch.setattr(bridge, "send_message", lambda *_a, **_k: None)
-    handle_update(_photo_upd(777), "T", frozenset({777}), "c", tmp_path, str(tmp_path), 60, [])
-    assert reached == [1]
+def test_photo_allowed_user_triggers_handler(photo_env, tmp_path):
+    # 허용 user 사진(캡션 없음) → 핸들러 진입해 "캡션" 안내.
+    _fire(
+        photo_env,
+        _photo(777, caption=None),
+        allowed=frozenset({777}),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert any("캡션" in t for _c, t, _b in photo_env.sent)
 
 
 # ===========================================================================
-# ③ 버튼 선택지 — parse_choice_prompt / choice_keyboard / parse_callback(c)
-#   handle_callback c 분기 · await_reply 라우팅. 계약: 01_계획.md "③ 버튼 선택지".
+# ③ 버튼 선택지 — parse_choice_prompt(순수) + handle_event c 분기 · await_reply
 # ===========================================================================
 
 
@@ -1713,19 +1811,16 @@ def test_parse_choice_prompt_normal():
 
 
 def test_parse_choice_prompt_inline_question_default():
-    # 질문 텍스트가 없으면 기본 문구.
     out = parse_choice_prompt("❓선택: [예|yes]|[아니오|no]")
     assert out == ("선택하세요", [("예", "yes"), ("아니오", "no")])
 
 
 def test_parse_choice_prompt_colon_newline():
-    # 🟡 회귀: claude 가 콜론 뒤 개행해도 tail 전체 스캔으로 파싱(왕복 붕괴 방지).
     out = parse_choice_prompt("무엇을 할까요?\n❓선택:\n[유지|keep]|[교체|swap]")
     assert out == ("무엇을 할까요?", [("유지", "keep"), ("교체", "swap")])
 
 
 def test_parse_choice_prompt_multiline_choices():
-    # 선택지가 여러 줄에 걸쳐도 대괄호 그룹을 모두 수집.
     out = parse_choice_prompt("❓선택:\n[예|yes]\n[아니오|no]")
     assert out == ("선택하세요", [("예", "yes"), ("아니오", "no")])
 
@@ -1736,9 +1831,9 @@ def test_parse_choice_prompt_non_choice_none():
 
 
 def test_parse_choice_prompt_broken_grammar_none():
-    assert parse_choice_prompt("❓선택: [값없음]") is None  # `|` 누락
-    assert parse_choice_prompt("❓선택: []|[|]") is None  # 빈 항목·빈 라벨/값
-    assert parse_choice_prompt("❓선택: 아무거나") is None  # 대괄호 없음
+    assert parse_choice_prompt("❓선택: [값없음]") is None
+    assert parse_choice_prompt("❓선택: []|[|]") is None
+    assert parse_choice_prompt("❓선택: 아무거나") is None
 
 
 def test_parse_choice_prompt_skips_malformed_keeps_valid():
@@ -1747,90 +1842,36 @@ def test_parse_choice_prompt_skips_malformed_keeps_valid():
 
 
 def test_parse_choice_prompt_uses_last_marker():
-    # 여러 줄 중 마지막 ❓선택 줄만 파싱(마지막 줄 규약).
     text = "설명 ❓선택: [무시|x]\n최종 질문\n❓선택: [진짜A|a]|[진짜B|b]"
     out = parse_choice_prompt(text)
     assert out is not None
     assert out[1] == [("진짜A", "a"), ("진짜B", "b")]
 
 
-def test_choice_keyboard_structure():
-    kb = choice_keyboard(77, [("유지", "keep"), ("교체", "swap")])
-    flat = [b for row in kb["inline_keyboard"] for b in row]
-    assert flat[0]["callback_data"] == "c:77:0"
-    assert flat[1]["callback_data"] == "c:77:1"
-    assert flat[-1] == {"text": "✏️ 직접입력", "callback_data": "c:77:other"}
-
-
-def test_choice_keyboard_two_per_row():
-    kb = choice_keyboard(1, [("a", "1"), ("b", "2"), ("c", "3")])
-    # 3 선택지 + 직접입력 = 4버튼 → 2개씩 2행.
-    assert [len(r) for r in kb["inline_keyboard"]] == [2, 2]
-
-
-def test_choice_keyboard_callback_data_within_64_bytes():
-    kb = choice_keyboard(123456, [("긴라벨" * 30, "v")])
-    for row in kb["inline_keyboard"]:
-        for btn in row:
-            assert len(btn["callback_data"].encode("utf-8")) <= 64
-
-
-def test_parse_callback_choice_index():
-    assert parse_callback("c:55:0") == ("c", "55:0")
-    assert parse_callback("c:55:12") == ("c", "55:12")
-
-
-def test_parse_callback_choice_other():
-    assert parse_callback("c:55:other") == ("c", "55:other")
-
-
-def test_parse_callback_choice_rejects_bad():
-    assert parse_callback("c:x:1") is None  # msg_id 비정수
-    assert parse_callback("c:55:bad") is None  # sel 비정수·비other
-    assert parse_callback("c:55") is None  # 파트 부족
-    assert parse_callback("c:55:1:2") is None  # 파트 초과
-
-
-def test_parse_callback_choice_rejects_unicode_digits():
-    # L-3: 전각·위첨자 등 유니코드 숫자(int 통과, isascii 실패)를 차단.
-    fullwidth = "c:" + chr(0xFF15) * 2 + ":1"  # 전각 숫자 msg_id(FULLWIDTH DIGIT FIVE)
-    superscript = "c:55:" + chr(0x00B2)  # 위첨자 숫자 idx(SUPERSCRIPT TWO)
-    assert parse_callback(fullwidth) is None
-    assert parse_callback(superscript) is None
-
-
-# --- handle_callback c 분기 · await_reply 라우팅 (resume_run 스파이) ---
+# --- handle_event c 분기 · await_reply 라우팅 (resume_run 스파이) ---
 
 
 @pytest.fixture
 def choice_env(monkeypatch):
-    """pending 격리 + answer/send/edit/resume_run 스파이(실제 claude 미실행)."""
+    """pending 격리 + resume_run 스파이. FakeAdapter(ack/send/edit 기록)를 yield."""
     bridge.pending.clear()
-    calls = {"answer": [], "send": [], "edit": [], "resume": []}
+    fa = FakeAdapter(secrets=[])
+    fa.resumes = []
 
-    def fake_answer(_t, cq_id):
-        calls["answer"].append(cq_id)
+    def fake_resume(_a, _cid, _exe, proj, answer, question, sid, _to, user_id=None):
+        fa.resumes.append(
+            {"proj": proj, "answer": answer, "sid": sid, "question": question, "user_id": user_id}
+        )
 
-    def fake_send(_t, chat_id, text, _s, _rm=None):
-        calls["send"].append((chat_id, text))
-
-    def fake_edit(_t, _cid, message_id, text, _s):
-        calls["edit"].append((message_id, text))
-
-    def fake_resume(_tok, _cid, _exe, proj, answer, question, sid, _to, _sec):
-        calls["resume"].append({"proj": proj, "answer": answer, "sid": sid, "question": question})
-
-    monkeypatch.setattr(bridge, "answer_callback", fake_answer)
-    monkeypatch.setattr(bridge, "send_message", fake_send)
-    monkeypatch.setattr(bridge, "edit_message", fake_edit)
     monkeypatch.setattr(bridge, "resume_run", fake_resume)
-    yield calls
+    yield fa
     bridge.pending.clear()
 
 
-def _pending_entry(await_reply=False, chat_id=777):
+def _pending_entry(await_reply=False, chat_id=777, user_id=None):
     return {
         "chat_id": chat_id,
+        "user_id": user_id if user_id is not None else chat_id,  # M-1 소유 키(기본=chat_id)
         "session_id": "sid1",
         "project_path": "/proj",
         "choices": [("유지", "keep"), ("교체", "swap")],
@@ -1839,192 +1880,227 @@ def _pending_entry(await_reply=False, chat_id=777):
     }
 
 
-def test_callback_choice_selection_resumes(choice_env):
+def test_choice_selection_resumes(choice_env):
     bridge.pending[50] = _pending_entry()
-    handle_callback(_cq(777, "c:50:1"), "T", _ALLOWED, Path(), "root", [], "claude", 60)
-    assert len(choice_env["resume"]) == 1
-    r = choice_env["resume"][0]
+    _fire(choice_env, _btn(777, "c", "50:1"), target_root="root")
+    assert len(choice_env.resumes) == 1
+    r = choice_env.resumes[0]
     assert r["answer"] == "swap" and r["sid"] == "sid1" and r["proj"] == "/proj"
-    assert 50 not in bridge.pending  # 소비(중복 탭 방지)
-    assert any("교체" in t for _mid, t in choice_env["edit"])  # 버튼 제거 edit
+    assert 50 not in bridge.pending
+    assert any("교체" in t for _c, _m, t, _b in choice_env.edited)
 
 
-def test_callback_choice_other_sets_await(choice_env):
+def test_choice_other_sets_await(choice_env):
     bridge.pending[50] = _pending_entry()
-    handle_callback(_cq(777, "c:50:other"), "T", _ALLOWED, Path(), "root", [], "claude", 60)
+    _fire(choice_env, _btn(777, "c", "50:other"), target_root="root")
     assert bridge.pending[50]["await_reply"] is True
-    assert choice_env["resume"] == []
-    assert any("답장으로" in t for _c, t in choice_env["send"])
+    assert choice_env.resumes == []
+    assert any("답장으로" in t for _c, t, _b in choice_env.sent)
 
 
-def test_callback_choice_expired_pending(choice_env):
-    # 재시작 등으로 보류맵에 없으면 만료 안내(claude 미실행).
-    handle_callback(_cq(777, "c:99:0"), "T", _ALLOWED, Path(), "root", [], "claude", 60)
-    assert choice_env["resume"] == []
-    assert any("만료" in t for _mid, t in choice_env["edit"])
+def test_choice_expired_pending(choice_env):
+    _fire(choice_env, _btn(777, "c", "99:0"), target_root="root")
+    assert choice_env.resumes == []
+    assert any("만료" in t for _c, _m, t, _b in choice_env.edited)
 
 
-def test_callback_choice_out_of_range_ignored(choice_env):
+def test_choice_out_of_range_ignored(choice_env):
     bridge.pending[50] = _pending_entry()  # 선택지 2개(0,1)
-    handle_callback(_cq(777, "c:50:5"), "T", _ALLOWED, Path(), "root", [], "claude", 60)
-    assert choice_env["resume"] == []  # 범위 밖 → 무시
-    assert 50 in bridge.pending  # 소비 안 함
+    _fire(choice_env, _btn(777, "c", "50:5"), target_root="root")
+    assert choice_env.resumes == []
+    assert 50 in bridge.pending
 
 
-def test_callback_choice_disallowed_chat_blocked(choice_env):
+def test_choice_disallowed_user_blocked(choice_env):
     bridge.pending[50] = _pending_entry()
-    handle_callback(_cq(999, "c:50:0"), "T", _ALLOWED, Path(), "root", [], "claude", 60)
-    assert choice_env["resume"] == []
-    assert choice_env["answer"] == []  # 허용목록 게이트에서 즉시 차단
+    _fire(choice_env, _btn(999, "c", "50:0"), target_root="root")
+    assert choice_env.resumes == []
+    assert choice_env.acked == []  # 허용목록 게이트에서 즉시 차단(ack 도 안 함)
     assert bridge.pending[50]["await_reply"] is False
-
-
-def _text_upd(chat_id, text):
-    return {"message": {"chat": {"id": chat_id}, "text": text}}
 
 
 def test_await_reply_routes_text_to_resume(choice_env):
     bridge.pending[50] = _pending_entry(await_reply=True)
-    handle_update(_text_upd(777, "직접 입력한 답"), "T", _ALLOWED, "claude", Path(), "root", 60, [])
-    assert len(choice_env["resume"]) == 1
-    assert choice_env["resume"][0]["answer"] == "직접 입력한 답"
-    assert 50 not in bridge.pending  # 소비
+    _fire(choice_env, _txt(777, "직접 입력한 답"), target_root="root")
+    assert len(choice_env.resumes) == 1
+    assert choice_env.resumes[0]["answer"] == "직접 입력한 답"
+    assert 50 not in bridge.pending
 
 
 def test_await_reply_cancel_clears(choice_env):
     bridge.pending[50] = _pending_entry(await_reply=True)
-    handle_update(_text_upd(777, "/cancel"), "T", _ALLOWED, "claude", Path(), "root", 60, [])
+    _fire(choice_env, _txt(777, "/cancel"), target_root="root")
     assert 50 not in bridge.pending
-    assert choice_env["resume"] == []  # /cancel 은 resume 하지 않음
-    assert any("취소" in t for _c, t in choice_env["send"])
+    assert choice_env.resumes == []
+    assert any("취소" in t for _c, t, _b in choice_env.sent)
 
 
 def test_await_reply_slash_command_falls_through(choice_env, tmp_path):
-    # #3: 직접입력 대기 중 슬래시 명령(/projects)은 답으로 삼키지 않고 정상 명령 처리로 폴백.
     (tmp_path / "etf_info").mkdir()
     bridge.pending[50] = _pending_entry(await_reply=True)
-    handle_update(
-        _text_upd(777, "/projects"), "T", _ALLOWED, "claude", tmp_path, str(tmp_path), 60, []
-    )
-    assert choice_env["resume"] == []  # 명령이 resume 답으로 삼켜지지 않음
-    assert any("대상 프로젝트" in t for _c, t in choice_env["send"])  # /projects 정상 처리
-    assert 50 in bridge.pending  # 대기는 소비되지 않고 유지(명령이라 답이 아님)
+    _fire(choice_env, _txt(777, "/projects"), target_root=str(tmp_path))
+    assert choice_env.resumes == []
+    assert any("대상 프로젝트" in t for _c, t, _b in choice_env.sent)
+    assert 50 in bridge.pending
 
 
 def test_await_reply_non_slash_still_routes_to_resume(choice_env):
-    # #3 회귀: 슬래시 아닌 텍스트(push 별칭 포함)는 여전히 답으로 라우팅(슬래시만 예외).
     bridge.pending[50] = _pending_entry(await_reply=True)
-    handle_update(_text_upd(777, "push"), "T", _ALLOWED, "claude", Path(), "root", 60, [])
-    assert len(choice_env["resume"]) == 1  # push 별칭도 대기 중엔 유효한 답
-    assert choice_env["resume"][0]["answer"] == "push"
-    assert 50 not in bridge.pending  # 소비
+    _fire(choice_env, _txt(777, "push"), target_root="root")
+    assert len(choice_env.resumes) == 1
+    assert choice_env.resumes[0]["answer"] == "push"
+    assert 50 not in bridge.pending
 
 
-# --- M-1: pending chat_id 격리 (타 chat 세션 탈취 방지) ---
-
-_ALLOWED2 = frozenset({777, 888})
-
-
-def test_callback_choice_other_chat_rejected(choice_env):
-    bridge.pending[50] = _pending_entry(chat_id=777)  # 777 소유
-    handle_callback(_cq(888, "c:50:1"), "T", _ALLOWED2, Path(), "root", [], "claude", 60)
-    assert choice_env["resume"] == []  # 888 은 이어받지 못함(만료 취급)
-    assert 50 in bridge.pending  # 777 항목 그대로
+def test_choice_other_chat_rejected(choice_env):
+    bridge.pending[50] = _pending_entry(chat_id=777)
+    _fire(choice_env, _btn(888, "c", "50:1"), allowed=_ALLOWED2, target_root="root")
+    assert choice_env.resumes == []
+    assert 50 in bridge.pending
 
 
 def test_await_reply_other_chat_not_routed(choice_env):
     bridge.pending[50] = _pending_entry(await_reply=True, chat_id=777)
-    handle_update(_text_upd(888, "가로채기 시도"), "T", _ALLOWED2, "claude", Path(), "root", 60, [])
-    assert choice_env["resume"] == []  # 888 답장이 777 세션으로 안 감
-    assert 50 in bridge.pending  # 777 대기 유지
+    _fire(choice_env, _txt(888, "가로채기 시도"), allowed=_ALLOWED2, target_root="root")
+    assert choice_env.resumes == []
+    assert 50 in bridge.pending
 
 
-@pytest.mark.usefixtures("choice_env")
-def test_cancel_other_chat_keeps_await():
+def test_cancel_other_chat_keeps_await(choice_env):
     bridge.pending[50] = _pending_entry(await_reply=True, chat_id=777)
-    handle_update(_text_upd(888, "/cancel"), "T", _ALLOWED2, "claude", Path(), "root", 60, [])
-    assert 50 in bridge.pending  # 888 /cancel 이 777 대기를 해제하지 못함
+    _fire(choice_env, _txt(888, "/cancel"), allowed=_ALLOWED2, target_root="root")
+    assert 50 in bridge.pending
+
+
+# --- M-1: 같은 채널·다른 user 격리(공유 채널 다중 유저 세션탈취 차단) ---
+
+
+def test_choice_same_channel_other_user_rejected(choice_env):
+    # 같은 채널(100)이라도 소유자(777)가 아닌 user(888)는 선택을 소비 못 한다.
+    bridge.pending[50] = _pending_entry(chat_id=100, user_id=777)
+    _fire(
+        choice_env,
+        _btn(888, "c", "50:1", channel_id=100),
+        allowed=_ALLOWED2,
+        target_root="root",
+    )
+    assert choice_env.resumes == []
+    assert 50 in bridge.pending  # 미소비
+    assert any("만료" in t for _c, _m, t, _b in choice_env.edited)
+
+
+def test_choice_same_channel_owner_consumes(choice_env):
+    # 소유자(777) 본인은 같은 채널(100)에서 정상 소비.
+    bridge.pending[50] = _pending_entry(chat_id=100, user_id=777)
+    _fire(
+        choice_env,
+        _btn(777, "c", "50:1", channel_id=100),
+        allowed=_ALLOWED2,
+        target_root="root",
+    )
+    assert len(choice_env.resumes) == 1
+    assert choice_env.resumes[0]["user_id"] == 777  # 소유자로 재실행
+    assert 50 not in bridge.pending
+
+
+def test_await_reply_same_channel_other_user_not_routed(choice_env):
+    bridge.pending[50] = _pending_entry(await_reply=True, chat_id=100, user_id=777)
+    _fire(
+        choice_env,
+        _txt(888, "가로채기 시도", channel_id=100),
+        allowed=_ALLOWED2,
+        target_root="root",
+    )
+    assert choice_env.resumes == []
+    assert 50 in bridge.pending  # 남의 대기 안 건드림
+
+
+def test_cancel_same_channel_other_user_keeps_await(choice_env):
+    bridge.pending[50] = _pending_entry(await_reply=True, chat_id=100, user_id=777)
+    _fire(
+        choice_env,
+        _txt(888, "/cancel", channel_id=100),
+        allowed=_ALLOWED2,
+        target_root="root",
+    )
+    assert 50 in bridge.pending  # 888 의 /cancel 은 777 의 대기를 해제 못 함
 
 
 # --- 핵심 배선 회귀 잠금: _render_choices / resume_run / run_claude_with_progress ---
 
 
-def test_render_choices_registers_pending_and_keyboard(monkeypatch):
+def test_render_choices_registers_pending_and_keyboard():
     bridge.pending.clear()
-    kb_calls = []
-    monkeypatch.setattr(bridge, "send_message_get_id", lambda *_a: 200)
-    monkeypatch.setattr(
-        bridge, "edit_message_reply_markup", lambda _t, _c, mid, kb: kb_calls.append((mid, kb))
-    )
-    bridge._render_choices("T", 777, "/proj", "sid-abc", ("Q", [("유지", "keep")]), [])
+    fa = FakeAdapter(secrets=[], send_ids=[200])
+    bridge._render_choices(fa, 100, "/proj", "sid-abc", ("Q", [("유지", "keep")]), 777)
     assert 200 in bridge.pending
     e = bridge.pending[200]
-    assert e["chat_id"] == 777 and e["session_id"] == "sid-abc" and e["project_path"] == "/proj"
-    assert kb_calls and kb_calls[0][0] == 200  # 얻은 message_id 로 키보드 부착
+    assert e["chat_id"] == 100 and e["session_id"] == "sid-abc" and e["project_path"] == "/proj"
+    assert e["user_id"] == 777  # M-1: 선택지 소유자 저장(공유 채널 세션탈취 차단)
+    # 얻은 message_id(200)로 키보드 부착(edit 에 buttons).
+    assert fa.edited and fa.edited[0][1] == 200
+    assert fa.edited[0][3] == choice_buttons(200, [("유지", "keep")])
     bridge.pending.clear()
 
 
-def test_render_choices_skips_without_session_id(monkeypatch):
+def test_render_choices_skips_without_session_id():
     bridge.pending.clear()
-    monkeypatch.setattr(bridge, "send_message_get_id", lambda *_a: 200)
-    bridge._render_choices("T", 777, "/proj", None, ("Q", [("a", "1")]), [])  # session_id 없음
+    fa = FakeAdapter(secrets=[], send_ids=[200, 200])
+    bridge._render_choices(fa, 777, "/proj", None, ("Q", [("a", "1")]))
     assert bridge.pending == {}
-    bridge._render_choices("T", 777, "/proj", 123, ("Q", [("a", "1")]), [])  # 비-str
+    bridge._render_choices(fa, 777, "/proj", 123, ("Q", [("a", "1")]))
     assert bridge.pending == {}
+    bridge.pending.clear()
 
 
-def test_render_choices_masks_label(monkeypatch):
+def test_render_choices_masks_label():
     # L-2: 라벨은 마스킹 안 된 result 재파싱분 → 버튼 text·저장분 모두 마스킹돼야.
     bridge.pending.clear()
-    captured = {}
-    monkeypatch.setattr(bridge, "send_message_get_id", lambda *_a: 200)
-    monkeypatch.setattr(
-        bridge, "edit_message_reply_markup", lambda _t, _c, _m, kb: captured.update(kb=kb)
-    )
-    bridge._render_choices("T", 777, "/p", "sid-1", ("Q", [("토큰SECRET표시", "v")]), ["SECRET"])
-    label = captured["kb"]["inline_keyboard"][0][0]["text"]
+    fa = FakeAdapter(secrets=["SECRET"], send_ids=[200])
+    bridge._render_choices(fa, 777, "/p", "sid-1", ("Q", [("토큰SECRET표시", "v")]))
+    label = fa.edited[0][3][0].label
     assert "SECRET" not in label and "***" in label
     assert bridge.pending[200]["choices"][0][0] == label  # 저장분도 마스킹
     bridge.pending.clear()
 
 
 def test_resume_run_fallback_on_resume_error(monkeypatch):
-    # 🟢 resume 실패(is_error) → --resume 없이 직전 질문+답 요약 재주입 폴백.
     calls = []
 
-    def stub(_tok, _cid, _hdr, _exe, _proj, task, _to, _sec, **kw):
-        calls.append({"task": task, "resume": kw.get("resume")})
+    def stub(_a, _cid, _hdr, _exe, _proj, task, _to, _allow=None, resume=None, user_id=None):
+        calls.append({"task": task, "resume": resume, "user_id": user_id})
         return {"is_error": len(calls) == 1, "result": ""}  # 첫(resume) 실패, 폴백 성공
 
     monkeypatch.setattr(bridge, "run_claude_with_progress", stub)
-    bridge.resume_run("T", 777, "claude", "/p", "내 답", "원 질문", "sid-1", 60, [])
+    bridge.resume_run(
+        FakeAdapter(), 777, "claude", "/p", "내 답", "원 질문", "sid-1", 60, user_id=777
+    )
     assert len(calls) == 2
-    assert calls[0]["resume"] == "sid-1"  # 1차: resume 시도
-    assert calls[1]["resume"] is None  # 2차: 폴백(resume 없음)
-    assert "원 질문" in calls[1]["task"] and "내 답" in calls[1]["task"]  # 맥락 재주입
+    assert calls[0]["resume"] == "sid-1"
+    assert calls[1]["resume"] is None
+    assert calls[0]["user_id"] == 777 and calls[1]["user_id"] == 777  # M-1: 폴백에도 소유자 전파
+    assert "원 질문" in calls[1]["task"] and "내 답" in calls[1]["task"]
 
 
 def test_rcwp_read_only_skips_choice_render(monkeypatch):
-    # 사진 Read 경로(allowed_tools=["Read"])는 ❓선택이 있어도 버튼 렌더 안 함.
     bridge.pending.clear()
-
-    def fake_run(*_a, **_k):
-        return {"result": "Q\n❓선택: [a|1]|[b|2]", "is_error": False, "session_id": "s"}
-
-    monkeypatch.setattr(bridge, "run_claude", fake_run)
-    monkeypatch.setattr(bridge, "send_message_get_id", lambda *_a: 10)
-    monkeypatch.setattr(bridge, "edit_message", lambda *_a: None)
-    monkeypatch.setattr(bridge, "send_message", lambda *_a, **_k: None)
-    monkeypatch.setattr(bridge, "edit_message_reply_markup", lambda *_a: None)
-    bridge.run_claude_with_progress("T", 777, "H", "c", "/p", "task", 60, [], ["Read"])
+    monkeypatch.setattr(
+        bridge,
+        "run_claude",
+        lambda *_a, **_k: {
+            "result": "Q\n❓선택: [a|1]|[b|2]",
+            "is_error": False,
+            "session_id": "s",
+        },
+    )
+    fa = FakeAdapter(secrets=[], send_ids=[10])
+    bridge.run_claude_with_progress(fa, 777, "H", "c", "/p", "task", 60, ["Read"])
     assert bridge.pending == {}
     bridge.pending.clear()
 
 
 def test_rcwp_full_path_renders_and_hides_marker(monkeypatch):
-    # full 경로: ❓선택 감지 → 버튼 렌더 + 최종 회신에서 마커 줄 숨김(#5).
     bridge.pending.clear()
-    edits = []
     monkeypatch.setattr(
         bridge,
         "run_claude",
@@ -2034,20 +2110,15 @@ def test_rcwp_full_path_renders_and_hides_marker(monkeypatch):
             "session_id": "sid-1",
         },
     )
-    ids = iter([10, 11])
-    monkeypatch.setattr(bridge, "send_message_get_id", lambda *_a: next(ids))
-    monkeypatch.setattr(bridge, "edit_message", lambda _t, _c, _m, txt, _s: edits.append(txt))
-    monkeypatch.setattr(bridge, "send_message", lambda *_a, **_k: None)
-    monkeypatch.setattr(bridge, "edit_message_reply_markup", lambda *_a: None)
-    bridge.run_claude_with_progress("T", 777, "H", "c", "/p", "task", 60, [])
-    assert edits and all("❓선택" not in t for t in edits)  # 내부 문법 미노출
+    fa = FakeAdapter(secrets=[], send_ids=[10, 11])
+    bridge.run_claude_with_progress(fa, 777, "H", "c", "/p", "task", 60)
+    assert fa.edited and all("❓선택" not in t for _c, _m, t, _b in fa.edited)
     assert 11 in bridge.pending  # 버튼 메시지(두 번째 id)에 보류맵 등록
     assert bridge.pending[11]["chat_id"] == 777
     bridge.pending.clear()
 
 
 def test_rcwp_choice_sets_choice_rendered_flag(monkeypatch):
-    # #4: 선택지 감지 시 반환 data 에 choice_rendered 플래그가 서야(git 노트 스킵 신호).
     bridge.pending.clear()
     monkeypatch.setattr(
         bridge,
@@ -2058,182 +2129,381 @@ def test_rcwp_choice_sets_choice_rendered_flag(monkeypatch):
             "session_id": "sid-1",
         },
     )
-    monkeypatch.setattr(bridge, "send_message_get_id", lambda *_a: 10)
-    monkeypatch.setattr(bridge, "edit_message", lambda *_a: None)
-    monkeypatch.setattr(bridge, "send_message", lambda *_a, **_k: None)
-    monkeypatch.setattr(bridge, "edit_message_reply_markup", lambda *_a: None)
-    data = bridge.run_claude_with_progress("T", 777, "H", "c", "/p", "task", 60, [])
+    fa = FakeAdapter(secrets=[], send_ids=[10, 11])
+    data = bridge.run_claude_with_progress(fa, 777, "H", "c", "/p", "task", 60)
     assert data.get("choice_rendered") is True
     bridge.pending.clear()
 
 
 def test_rcwp_no_choice_no_flag(monkeypatch):
-    # #4 회귀: 선택지 없는 실행엔 choice_rendered 가 서지 않음(git 노트 정상 발송 유지).
     bridge.pending.clear()
     monkeypatch.setattr(
         bridge,
         "run_claude",
         lambda *_a, **_k: {"result": "끝", "is_error": False, "session_id": "s"},
     )
-    monkeypatch.setattr(bridge, "send_message_get_id", lambda *_a: 10)
-    monkeypatch.setattr(bridge, "edit_message", lambda *_a: None)
-    monkeypatch.setattr(bridge, "send_message", lambda *_a, **_k: None)
-    data = bridge.run_claude_with_progress("T", 777, "H", "c", "/p", "task", 60, [])
+    fa = FakeAdapter(secrets=[], send_ids=[10])
+    data = bridge.run_claude_with_progress(fa, 777, "H", "c", "/p", "task", 60)
     assert not data.get("choice_rendered")
     bridge.pending.clear()
 
 
-def test_handle_update_skips_git_note_when_choice_rendered(monkeypatch, tmp_path):
-    # #4 배선: choice_rendered 실행에선 handle_update 가 git '변경 없음' 노트를 건너뛴다.
+def test_rcwp_timeout_stale_progress_does_not_overwrite_final(monkeypatch):
+    # 회귀 잠금(Medium): 타임아웃 킬 후에도 리더 스레드가 잠깐 살아 on_event 를 더 밀 수 있다.
+    # finished 가드가 없으면 그 스테일 진행 edit 가 최종 결과 edit 뒤에 도착해 덮어쓴다.
+    # throttle 을 0 으로 낮춰(실제론 킬~join 지연이 2.5s 를 넘김) 스테일 이벤트가 실제로 edit 를
+    # 시도하게 만든다 — 가드가 없으면 이 테스트가 실패해야 한다(회귀 실효성 보장).
+    bridge.pending.clear()
+    monkeypatch.setattr(bridge, "PROGRESS_THROTTLE_SEC", 0)
+    captured = {}
+
+    def fake_run(_exe, _path, _task, _to, on_event, *_a, **_k):
+        on_event(_assistant({"type": "text", "text": "진행 중 첫 줄"}))  # 정상 진행 edit 1회
+        captured["on_event"] = on_event  # 완료 후 잔존 리더가 밀 이벤트를 재현하려 참조 보관
+        return {"is_error": True, "result": "타임아웃(60s) 초과 — 작업을 중단했습니다."}
+
+    monkeypatch.setattr(bridge, "run_claude", fake_run)
+    fa = FakeAdapter(secrets=[], send_ids=[10])
+    bridge.run_claude_with_progress(fa, 777, "H", "c", "/p", "task", 60)
+    final_text = fa.edited[-1][2]
+    assert "타임아웃" in final_text  # 반환 직후 최종 상태 = 타임아웃 결과
+    # 스테일 리더가 완료 후 진행 이벤트를 더 밀어도 finished 가드로 무시(throttle=0 라도).
+    captured["on_event"](_assistant({"type": "text", "text": "스테일 진행 줄"}))
+    assert fa.edited[-1][2] == final_text  # 새 edit 미발생(최종 결과 보존)
+    assert all("스테일 진행 줄" not in txt for _c, _m, txt, _b in fa.edited)
+    bridge.pending.clear()
+
+
+def test_handle_text_skips_git_note_when_choice_rendered(monkeypatch, tmp_path):
     (tmp_path / "etf_info").mkdir()
     bridge.chat_selection.clear()
-    sent = []
     monkeypatch.setattr(
         bridge,
         "run_claude_with_progress",
         lambda *_a, **_k: {"is_error": False, "result": "ok", "choice_rendered": True},
     )
-    monkeypatch.setattr(
-        bridge, "send_message", lambda _t, _c, text, _s, _rm=None: sent.append(text)
-    )
     note_calls = []
     monkeypatch.setattr(bridge, "git_status_note", lambda _r: note_calls.append(1) or "변경 없음.")
     monkeypatch.setattr(bridge, "git_ahead", lambda _r: 0)
-    handle_update(
-        _text_upd(777, "etf_info 뭐 골라줘"), "T", _ALLOWED, "c", tmp_path, str(tmp_path), 900, []
-    )
-    assert note_calls == []  # git 상태 조회 자체를 건너뜀
-    assert all(bridge.HEADER_NOTE not in t for t in sent)  # 노트 미발송
+    fa = FakeAdapter(secrets=[])
+    _fire(fa, _txt(777, "etf_info 뭐 골라줘"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert note_calls == []
+    assert all(bridge.HEADER_NOTE not in t for _c, t, _b in fa.sent)
     bridge.chat_selection.clear()
 
 
 def _git_note_env(monkeypatch, tmp_path, ahead):
-    """정상 작업 1건 실행 후 git 노트 전송 여부 검증용 스파이(ahead 값 고정)."""
     (tmp_path / "etf_info").mkdir()
     bridge.chat_selection.clear()
-    sent = []
     monkeypatch.setattr(
-        bridge,
-        "run_claude_with_progress",
-        lambda *_a, **_k: {"is_error": False, "result": "ok"},
-    )
-    monkeypatch.setattr(
-        bridge, "send_message", lambda _t, _c, text, _s, _rm=None: sent.append(text)
+        bridge, "run_claude_with_progress", lambda *_a, **_k: {"is_error": False, "result": "ok"}
     )
     monkeypatch.setattr(bridge, "git_ahead", lambda _r: ahead)
     monkeypatch.setattr(bridge, "git_status_note", lambda _r: f"로컬 커밋 {ahead}개 대기 — ...")
-    handle_update(
-        _text_upd(777, "etf_info 로그 봐줘"), "T", _ALLOWED, "c", tmp_path, str(tmp_path), 900, []
-    )
+    fa = FakeAdapter(secrets=[])
+    _fire(fa, _txt(777, "etf_info 로그 봐줘"), repo_root=tmp_path, target_root=str(tmp_path))
     bridge.chat_selection.clear()
-    return sent
+    return [t for _c, t, _b in fa.sent]
 
 
-def test_handle_update_skips_note_when_no_ahead(monkeypatch, tmp_path):
-    # B: ahead==0(dirty 여부 무관)이면 git 노트를 아예 보내지 않는다(데스크탑 WIP 잡음 제거).
+def test_handle_text_unsupported_message_prompts_text_only():
+    # 어댑터가 비지원 메시지(스티커 등)를 text="" 로 정규화 → 코어가 "텍스트만 처리" 안내.
+    fa = FakeAdapter()
+    _fire(fa, _txt(777, ""), target_root="root")
+    assert any("텍스트 메시지만" in t for _c, t, _b in fa.sent)
+
+
+def test_handle_text_skips_note_when_no_ahead(monkeypatch, tmp_path):
     sent = _git_note_env(monkeypatch, tmp_path, ahead=0)
     assert all(bridge.HEADER_NOTE not in t for t in sent)
 
 
-def test_handle_update_sends_note_when_ahead(monkeypatch, tmp_path):
-    # B: ahead>0(올릴 로컬 커밋 있음)일 때만 노트를 push 버튼과 함께 보낸다.
+def test_handle_text_sends_note_when_ahead(monkeypatch, tmp_path):
     sent = _git_note_env(monkeypatch, tmp_path, ahead=2)
     assert any(bridge.HEADER_NOTE in t for t in sent)
 
 
 # ===========================================================================
-# ④ chat 프로젝트 선택 고정 — 버튼 탭 → 프로젝트명 생략 실행 · 명시 우선 갱신 · chat 격리.
-#   handle_callback(p:) / handle_update 배선. run_claude_with_progress·git 스파이.
+# ④ chat 프로젝트 선택 고정 — 버튼 탭 → 이름 생략 실행 · 명시 우선 · chat 격리
 # ===========================================================================
 
 
 @pytest.fixture
 def sel_env(monkeypatch):
-    """chat_selection 격리 + run_claude_with_progress·send·git 스파이(실제 claude 미실행)."""
+    """chat_selection 격리 + run_claude_with_progress·git 스파이. FakeAdapter 를 yield."""
     bridge.chat_selection.clear()
-    calls = {"run": [], "send": []}
+    fa = FakeAdapter(secrets=[])
 
-    def fake_run(_tok, chat_id, _hdr, _exe, proj_path, task, _to, _sec, **_kw):
-        calls["run"].append((chat_id, proj_path, task))
+    def fake_run(_a, cid, _hdr, _exe, proj_path, task, _to, *_args, **_kw):
+        fa.runs.append((cid, proj_path, task))
         return {"is_error": False, "result": "ok"}
 
-    def fake_send(_t, chat_id, text, _s, _rm=None):
-        calls["send"].append((chat_id, text))
-
     monkeypatch.setattr(bridge, "run_claude_with_progress", fake_run)
-    monkeypatch.setattr(bridge, "send_message", fake_send)
-    monkeypatch.setattr(bridge, "answer_callback", lambda *_a: None)
-    monkeypatch.setattr(bridge, "git_status_note", lambda _root: "변경 없음.")
-    monkeypatch.setattr(bridge, "git_ahead", lambda _root: 0)
-    yield calls
+    monkeypatch.setattr(bridge, "git_status_note", lambda _r: "변경 없음.")
+    monkeypatch.setattr(bridge, "git_ahead", lambda _r: 0)
+    yield fa
     bridge.chat_selection.clear()
-
-
-def _sel_msg(chat_id, text):
-    return {"message": {"chat": {"id": chat_id}, "text": text}}
 
 
 def test_button_select_then_bare_task_uses_selection(sel_env, tmp_path):
-    # (a) 버튼 탭으로 선택 고정 → 프로젝트명 없는 메시지가 그 프로젝트로 실행(전체가 task)
     (tmp_path / "trading_info").mkdir()
     root = str(tmp_path)
-    handle_callback(_cq(777, "p:trading_info"), "T", _ALLOWED, tmp_path, root, [])
+    _fire(sel_env, _btn(777, "p", "trading_info"), repo_root=tmp_path, target_root=root)
     assert bridge.chat_selection[777] == "trading_info"
-    handle_update(
-        _sel_msg(777, "시간대 별로 체크 각 몇시?"), "T", _ALLOWED, "c", tmp_path, root, 900, []
-    )
-    assert sel_env["run"] == [(777, str(tmp_path / "trading_info"), "시간대 별로 체크 각 몇시?")]
+    _fire(sel_env, _txt(777, "시간대 별로 체크 각 몇시?"), repo_root=tmp_path, target_root=root)
+    assert sel_env.runs == [(777, str(tmp_path / "trading_info"), "시간대 별로 체크 각 몇시?")]
 
 
 def test_explicit_message_updates_selection(sel_env, tmp_path):
-    # (b) 명시 우선 + 선택 갱신 → 이후 프로젝트명 생략 시 갱신된 선택으로 실행
     (tmp_path / "trading_info").mkdir()
     (tmp_path / "etf_info").mkdir()
     root = str(tmp_path)
-    handle_update(
-        _sel_msg(777, "trading_info 헤더 고쳐"), "T", _ALLOWED, "c", tmp_path, root, 900, []
-    )
+    _fire(sel_env, _txt(777, "trading_info 헤더 고쳐"), repo_root=tmp_path, target_root=root)
     assert bridge.chat_selection[777] == "trading_info"
-    handle_update(_sel_msg(777, "etf_info 로그 봐줘"), "T", _ALLOWED, "c", tmp_path, root, 900, [])
-    assert bridge.chat_selection[777] == "etf_info"  # 명시로 덮어쓰기
-    handle_update(_sel_msg(777, "이번엔 이거 해줘"), "T", _ALLOWED, "c", tmp_path, root, 900, [])
-    assert sel_env["run"][-1][:2] == (777, str(tmp_path / "etf_info"))
-    assert sel_env["run"][-1][2] == "이번엔 이거 해줘"
+    _fire(sel_env, _txt(777, "etf_info 로그 봐줘"), repo_root=tmp_path, target_root=root)
+    assert bridge.chat_selection[777] == "etf_info"
+    _fire(sel_env, _txt(777, "이번엔 이거 해줘"), repo_root=tmp_path, target_root=root)
+    assert sel_env.runs[-1][:2] == (777, str(tmp_path / "etf_info"))
+    assert sel_env.runs[-1][2] == "이번엔 이거 해줘"
 
 
 def test_no_selection_no_project_errors(sel_env, tmp_path):
-    # (c) 선택 없고 프로젝트명 아님 → 실행 없이 "프로젝트 못 찾음" 안내
     (tmp_path / "trading_info").mkdir()
-    handle_update(
-        _sel_msg(777, "시간대 별로 체크"), "T", _ALLOWED, "c", tmp_path, str(tmp_path), 900, []
-    )
-    assert sel_env["run"] == []
-    assert any("찾지 못했" in t for _c, t in sel_env["send"])
+    _fire(sel_env, _txt(777, "시간대 별로 체크"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert sel_env.runs == []
+    assert any("찾지 못했" in t for _c, t, _b in sel_env.sent)
     assert 777 not in bridge.chat_selection
 
 
 def test_selection_isolated_per_chat(sel_env, tmp_path):
-    # (d) 한 chat 의 선택은 다른 chat 으로 새지 않는다(M-1 격리)
     (tmp_path / "trading_info").mkdir()
     root = str(tmp_path)
     allowed = frozenset({777, 888})
-    handle_callback(_cq(777, "p:trading_info"), "T", allowed, tmp_path, root, [])
-    assert bridge.chat_selection == {777: "trading_info"}  # 888 미설정
-    # chat 888 은 선택 없음 → 프로젝트명 없는 메시지는 에러(실행 없음)
-    handle_update(_sel_msg(888, "시간대 별로"), "T", allowed, "c", tmp_path, root, 900, [])
-    assert sel_env["run"] == []
+    _fire(
+        sel_env,
+        _btn(777, "p", "trading_info"),
+        allowed=allowed,
+        repo_root=tmp_path,
+        target_root=root,
+    )
+    assert bridge.chat_selection == {777: "trading_info"}
+    _fire(sel_env, _txt(888, "시간대 별로"), allowed=allowed, repo_root=tmp_path, target_root=root)
+    assert sel_env.runs == []
     assert 888 not in bridge.chat_selection
 
 
+def test_event_project_used_as_channel_selection(sel_env, tmp_path):
+    # 계약 §1.4: 디스코드 채널명(event.project)이 실존 프로젝트면 접두 없는 지시도 그 프로젝트로
+    # 실행한다("채널=프로젝트" UX). chat_selection 없이 event.project 만으로 라우팅되는지 잠금.
+    (tmp_path / "etf_info").mkdir()
+    root = str(tmp_path)
+    ev = Event(kind="text", channel_id=555, user_id=777, text="로그 봐줘", project="etf_info")
+    _fire(sel_env, ev, repo_root=tmp_path, target_root=root)
+    assert sel_env.runs == [(555, str(tmp_path / "etf_info"), "로그 봐줘")]
+
+
+def test_event_project_nonexistent_falls_through(sel_env, tmp_path):
+    # 채널명이 실존 프로젝트가 아니면(일반 채널) 기존 "못 찾음" 경로와 100% 동일 — 새 규칙 없음.
+    (tmp_path / "etf_info").mkdir()
+    ev = Event(kind="text", channel_id=555, user_id=777, text="로그 봐줘", project="없는채널")
+    _fire(sel_env, ev, repo_root=tmp_path, target_root=str(tmp_path))
+    assert sel_env.runs == []
+    assert any("찾지 못했" in t for _c, t, _b in sel_env.sent)
+
+
+def test_telegram_project_none_unaffected(sel_env, tmp_path):
+    # 텔레그램은 project=None → event.project 분기 무영향, 기존 chat_selection 경로 그대로.
+    (tmp_path / "trading_info").mkdir()
+    root = str(tmp_path)
+    _fire(sel_env, _btn(777, "p", "trading_info"), repo_root=tmp_path, target_root=root)
+    _fire(sel_env, _txt(777, "시간대 체크"), repo_root=tmp_path, target_root=root)
+    assert sel_env.runs == [(777, str(tmp_path / "trading_info"), "시간대 체크")]
+
+
 def test_bare_project_name_pins_selection_without_running(sel_env, monkeypatch, tmp_path):
-    # 프로젝트명만 보내면(작업 없음) 선택만 고정하고 안내(실행 없음). 프로덕션 JSON 비의존.
     monkeypatch.setattr(bridge, "PROJECT_LABELS", {"trading_info": "데모 라벨"})
     (tmp_path / "trading_info").mkdir()
     root = str(tmp_path)
-    handle_update(_sel_msg(777, "trading_info"), "T", _ALLOWED, "c", tmp_path, root, 900, [])
+    _fire(sel_env, _txt(777, "trading_info"), repo_root=tmp_path, target_root=root)
     assert bridge.chat_selection[777] == "trading_info"
-    assert sel_env["run"] == []
-    # 안내에 라벨 + 폴더명이 함께 노출("데모 라벨(trading_info) 선택 —").
+    assert sel_env.runs == []
     assert any(
-        "데모 라벨" in t and "trading_info" in t and "선택" in t for _c, t in sel_env["send"]
+        "데모 라벨" in t and "trading_info" in t and "선택" in t for _c, t, _b in sel_env.sent
     )
+
+
+# ===========================================================================
+# 어댑터 정규화 — TelegramAdapter update dict → Event (§1.4)
+# ===========================================================================
+
+
+def _ta(tmp_path):
+    return TelegramAdapter("T", [], tmp_path / "offset")
+
+
+def test_adapter_normalizes_text_update(tmp_path):
+    upd = {"message": {"chat": {"id": 777}, "from": {"id": 777}, "message_id": 5, "text": "hi"}}
+    events = list(_ta(tmp_path)._to_events(upd))
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.kind == "text" and ev.channel_id == 777 and ev.user_id == 777
+    assert ev.text == "hi" and ev.message_id == 5
+
+
+def test_adapter_normalizes_non_text_to_empty(tmp_path):
+    # 스티커 등(text·photo 없음) → text="" 로 정규화(코어가 "텍스트만 처리").
+    upd = {"message": {"chat": {"id": 777}, "from": {"id": 777}, "message_id": 5}}
+    ev = next(iter(_ta(tmp_path)._to_events(upd)))
+    assert ev.kind == "text" and ev.text == ""
+
+
+def test_adapter_normalizes_photo_update(tmp_path):
+    upd = {
+        "message": {
+            "chat": {"id": 777},
+            "from": {"id": 777},
+            "message_id": 9,
+            "caption": "MU",
+            "photo": [{"file_id": "big", "width": 800, "height": 600}],
+        }
+    }
+    ev = next(iter(_ta(tmp_path)._to_events(upd)))
+    assert ev.kind == "photo" and ev.text == "MU" and ev.photo_ref == "big"
+
+
+def test_adapter_normalizes_callback_update(tmp_path):
+    cq = {
+        "id": "cq9",
+        "from": {"id": 777},
+        "message": {"chat": {"id": 777}, "message_id": 42},
+        "data": "p:etf_info",
+    }
+    ev = next(iter(_ta(tmp_path)._to_events({"callback_query": cq})))
+    assert ev.kind == "button" and ev.action == "p" and ev.action_arg == "etf_info"
+    assert ev.callback_id == "cq9" and ev.message_id == 42 and ev.user_id == 777
+
+
+def test_adapter_callback_unknown_data_action_empty(tmp_path):
+    # 미해석 callback_data → action="" (코어가 ack 후 무시).
+    cq = {"id": "cq9", "from": {"id": 777}, "message": {"chat": {"id": 777}}, "data": "bogus"}
+    ev = next(iter(_ta(tmp_path)._to_events({"callback_query": cq})))
+    assert ev.kind == "button" and ev.action == ""
+
+
+def test_adapter_ignores_edited_message(tmp_path):
+    # D6: edited_message 는 무시(신규 message 만 트리거).
+    upd = {"edited_message": {"chat": {"id": 777}, "text": "x"}}
+    assert list(_ta(tmp_path)._to_events(upd)) == []
+
+
+# ===========================================================================
+# 어댑터 송신 — 마스킹·청킹·오버플로·ack (코어→어댑터로 이동한 로직 회귀 잠금)
+# ===========================================================================
+
+
+def _spy_tg(monkeypatch):
+    """telegram_adapter.tg_call 을 기록 스파이로 대체(네트워크 없이 method·params 확인)."""
+    calls = []
+
+    def fake(_token, method, params, **_kw):  # timeout 은 키워드로 옴
+        calls.append((method, params))
+        return {"ok": True, "result": {"message_id": 100 + len(calls)}}
+
+    monkeypatch.setattr(telegram_adapter, "tg_call", fake)
+    return calls
+
+
+def test_adapter_send_chunks_and_buttons_last(monkeypatch, tmp_path):
+    calls = _spy_tg(monkeypatch)
+    ta = TelegramAdapter("T", [], tmp_path / "offset", limit=5)
+    mid = ta.send(777, "abcdefghij", [Button("L", "push")])  # 10자 / limit 5 → 2 청크
+    sends = [p for m, p in calls if m == "sendMessage"]
+    assert len(sends) == 2
+    assert "reply_markup" not in sends[0]  # 버튼은 마지막 청크에만
+    assert "reply_markup" in sends[1]
+    assert mid == 101  # 첫 청크 message_id 반환
+
+
+def test_adapter_send_masks_secrets(monkeypatch, tmp_path):
+    calls = _spy_tg(monkeypatch)
+    ta = TelegramAdapter("T", ["SECRET"], tmp_path / "offset")
+    ta.send(777, "tok=SECRET")
+    assert calls[0][1]["text"] == "tok=***"
+
+
+def test_adapter_edit_overflow_edits_then_sends(monkeypatch, tmp_path):
+    # 오버플로(§2.2): 첫 청크는 in-place 편집, 나머지는 후속 발행.
+    calls = _spy_tg(monkeypatch)
+    ta = TelegramAdapter("T", [], tmp_path / "offset", limit=5)
+    ta.edit(777, 42, "abcdefghij")  # 2 청크
+    methods = [m for m, _p in calls]
+    assert methods == ["editMessageText", "sendMessage"]
+
+
+def test_adapter_ack_answers_and_none_is_noop(monkeypatch, tmp_path):
+    calls = _spy_tg(monkeypatch)
+    ta = TelegramAdapter("T", [], tmp_path / "offset")
+    ta.ack("cq1")
+    assert calls[0][0] == "answerCallbackQuery"
+    ta.ack(None)  # callback_id=None → no-op
+    assert len(calls) == 1
+
+
+def test_adapter_send_returns_none_on_network_error(monkeypatch, tmp_path):
+    # §2/§3.3: 전송 실패는 로그만·None 반환(코어 직렬 루프가 죽지 않게).
+    def boom(*_a, **_kw):
+        raise urllib.error.URLError("down")
+
+    monkeypatch.setattr(telegram_adapter, "tg_call", boom)
+    ta = TelegramAdapter("T", [], tmp_path / "offset")
+    assert ta.send(777, "hi") is None
+
+
+def test_adapter_edit_swallows_network_error(monkeypatch, tmp_path):
+    # §2.2/§3.3: edit 는 rate-limit·네트워크 오류를 삼키고 계속(raise 안 함).
+    def boom(*_a, **_kw):
+        raise urllib.error.URLError("rate limited")
+
+    monkeypatch.setattr(telegram_adapter, "tg_call", boom)
+    ta = TelegramAdapter("T", [], tmp_path / "offset")
+    ta.edit(777, 42, "짧은 갱신")  # 예외가 전파되면 테스트 실패(반환 None, 조용히 계속)
+
+
+# ===========================================================================
+# 어댑터 offset 영속(§2.5) — 포이즌 메시지 재처리 방지(load/save + poll 선진행)
+# ===========================================================================
+
+
+def test_offset_roundtrip(tmp_path):
+    p = tmp_path / "offset"
+    save_offset(p, 4242)  # 임시파일→원자 교체(D2)
+    assert load_offset(p) == 4242
+
+
+def test_offset_missing_or_corrupt_returns_zero(tmp_path):
+    assert load_offset(tmp_path / "nope") == 0  # 파일 없음
+    p = tmp_path / "offset"
+    p.write_text("garbage", encoding="utf-8")
+    assert load_offset(p) == 0  # 손상값도 0(방어적) — 단, 0 이면 전량 재수신 위험은 감수
+
+
+def test_poll_advances_and_persists_offset(monkeypatch, tmp_path):
+    # D4/§2.5: update_id 를 먼저 추출해 offset 을 선진행·영속 → 포이즌 메시지 재수신 핫루프 방지.
+    ta = TelegramAdapter("T", [], tmp_path / "offset")
+    upd = {
+        "update_id": 50,
+        "message": {"chat": {"id": 777}, "from": {"id": 777}, "message_id": 1, "text": "hi"},
+    }
+    batches = iter([{"ok": True, "result": [upd]}])
+
+    def fake(_tok, _method, _params, **_kw):
+        b = next(batches, None)
+        if b is None:
+            ta.close()  # 두 번째 폴에서 루프 종료(무한 제너레이터 방지)
+            return {"ok": True, "result": []}
+        return b
+
+    monkeypatch.setattr(telegram_adapter, "tg_call", fake)
+    events = list(ta.poll())
+    assert [e.text for e in events] == ["hi"]
+    assert load_offset(tmp_path / "offset") == 51  # update_id+1 영속(다음 폴에서 재수신 안 함)

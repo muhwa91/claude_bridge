@@ -1,12 +1,14 @@
 # claude_bridge
 
-**폰에서 보낸 한 줄로 노트북의 Claude Code 를 원격 실행하는 ChatOps 브리지.**
-PC 앞에 없어도 텔레그램에 `<프로젝트> <지시>` 를 보내면 상시 켜 둔 노트북이 대신
+**폰에서 보낸 한 줄로 Claude Code 를 원격 실행하는 ChatOps 브리지.**
+PC 앞에 없어도 메신저에 `<프로젝트> <지시>` 를 보내면 상시 호스트가 대신
 작업하고, 커밋은 `push` 로 승인했을 때만 원격에 올린다.
+플랫폼 무관 코어 + 어댑터 계층 구조 — **텔레그램·디스코드 양 어댑터 병행**(디스코드 이관 진행 중).
 
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)
 ![Telegram Bot API](https://img.shields.io/badge/Telegram_Bot_API-26A5E4?logo=telegram&logoColor=white)
-![Dependencies](https://img.shields.io/badge/dependencies-0_(stdlib_only)-success)
+![discord.py](https://img.shields.io/badge/discord.py-2.7-5865F2?logo=discord&logoColor=white)
+![Dependencies](https://img.shields.io/badge/core-stdlib_only-success)
 
 <!-- 스크린샷: (추후) — 현재는 아래 아키텍처 다이어그램으로 대체 -->
 

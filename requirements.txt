@@ -1,0 +1,8 @@
+# claude_bridge 런타임 의존성.
+# 본체(bridge.py·adapter.py·telegram_adapter.py)는 표준 라이브러리 전용(의존성 0).
+# 디스코드 어댑터(discord_adapter.py)만 discord.py 를 쓰며, bridge.main 이 지연 import 하므로
+# 텔레그램만 쓰는 노트북에는 설치하지 않아도 된다(그 경우 이 파일 설치 불필요).
+#
+# 설치(디스코드로 구동할 때만):
+#   python -m pip install -r requirements.txt
+discord.py==2.7.1

@@ -1,13 +1,4 @@
-target-version = "py311"
-line-length = 100
-src = ["src", "app"]
-
-[lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "C4", "ARG", "PTH", "RUF"]
-ignore = []
-
-[lint.isort]
-known-first-party = ["app", "src"]
-
-[format]
-quote-style = "double"
+# 프로젝트 루트 ruff 설정 — 스택 프로파일(룰셋·line 100)을 실제 적용한다.
+# 루트에 설정이 없으면 `ruff check .`·CI 가 기본룰(E/F, line 88)로만 돌아
+# 프로파일(PTH·I·B·SIM·UP·C4·ARG·RUF)이 미적용된다.
+extend = "stacks/python/ruff.toml"
