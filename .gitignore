@@ -1,22 +1,37 @@
+# 자동 기록 로그 (질문·세션 기록은 커밋하지 않음 — 폴더 구조만 유지)
+logs/*.jsonl
+logs/*.log
+logs/sessions/
+logs/sessions.log
+
+# telegram_bridge 런타임 상태 (오프셋·pidfile·알림상태·수신사진은 커밋하지 않음)
+logs/offset
+logs/bridge.pid
+logs/notify_state.json
+logs/channel_map.json
+logs/channel_sessions.json
+logs/restart_notice.json
+logs/photos/
+
+# 의존성 (스택별)
+/vendor/
+/node_modules/
+/.venv/
+__pycache__/
+*.py[cod]
+
 # 환경설정·비밀값 (절대 커밋 금지)
 .env
 .env.*
 !.env.example
 
-# 런타임 상태 (오프셋·pidfile·알림상태·수신사진 포함)
-logs/
-!logs/.gitkeep
-
-# 알림 스케줄 — 개인 종목·체크 항목이므로 실제 파일은 커밋 금지 (예시만 커밋)
-schedules/notify.json
-
-# 파이썬
-__pycache__/
-*.py[cod]
-.venv/
-.mypy_cache/
-.ruff_cache/
-.pytest_cache/
+# 빌드 산출물
+/public/build/
+/public/hot
+/public/storage
+/dist/
+/build/
+*.egg-info/
 
 # OS·에디터
 .DS_Store

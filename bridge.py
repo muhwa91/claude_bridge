@@ -45,6 +45,9 @@ SCHEDULES_FILE = PROJECT_DIR / "schedules" / "notify.json"
 NOTIFY_STATE_FILE = LOG_DIR / "notify_state.json"
 RESTART_NOTICE_FILE = LOG_DIR / "restart_notice.json"  # '재시작' 요청 chat — 재기동 후 복귀 통지용
 CHANNEL_MAP_FILE = LOG_DIR / "channel_map.json"  # channelID→(kind,tag) 매핑(자동생성 §4.4)
+CHANNEL_SESSIONS_FILE = (
+    LOG_DIR / "channel_sessions.json"
+)  # channelID→마지막 claude session_id(연속성)
 PHOTO_DIR = LOG_DIR / "photos"
 # 오라클 VM 자동 재시도 런처가 매 루프 기록하는 상태 파일(절대경로 고정, 현 호스트 전용).
 # ponytail: 이 경로는 현 호스트(데스크탑) 런처 전용 — VM 이전 후엔 무의미(그땐 오라클 이미 확보).
@@ -102,6 +105,7 @@ COMMAND_ALIASES = {
     "/취소": "/cancel",
     "/재시작": "/restart",
     "/청소": "/clean",
+    "/새대화": "/new",
 }
 # 평문 별칭(슬래시 없이) — PUSH_WORDS 처럼 strip+casefold 단독 정확매칭. 문장 속 단어는 미발동
 # (routing 이 stripped 전체를 대조하므로 "취소 좀 해줘"·"프로젝트 알려줘"는 명령 아님).
@@ -112,10 +116,13 @@ PLAIN_ALIASES = {
     "취소": "/cancel",
     "재시작": "/restart",
     "청소": "/clean",
+    "새대화": "/new",
+    "리셋": "/new",
+    "새로시작": "/new",
 }
 # 별칭(슬래시·평문)도 COMMANDS 에 넣어 parse_message 가 이들을 프로젝트명으로 오해하지 않게 한다.
 COMMANDS = (
-    frozenset({"/help", "/start", "/projects", "/cancel", "/restart", "/clean"})
+    frozenset({"/help", "/start", "/projects", "/cancel", "/restart", "/clean", "/new"})
     | frozenset(COMMAND_ALIASES)
     | frozenset(PLAIN_ALIASES)
     | PUSH_WORDS
@@ -195,6 +202,13 @@ pending: dict[int, dict[str, Any]] = {}
 # 이후 프로젝트명 없이 작업만 보내면 이 선택으로 실행한다(연속 지시 편의). channel_id 키라
 # M-1 격리 유지. TTL 없음(덮어쓰기 전까지 유지 — 연속 지시 편의). 재시작 유실은 수용.
 chat_selection: dict[int, str] = {}
+
+# ⑤ 채널별 대화 세션 연속성(A안) — channel_id -> 마지막 claude session_id. 같은 채널의 연속
+# 메시지를 직전 세션으로 --resume 해 맥락을 유지한다(채팅처럼). '새대화'(/new)로 초기화하고,
+# 세션 만료·재개 실패는 새 세션으로 폴백한다(_run_with_session). channel_sessions.json 에 영속해
+# 재시작해도 이어진다. channel_id 키라 M-1 격리 유지. 값은 claude 발행 UUID 만 저장(사용자 입력 무).
+# ponytail: 직렬 워커(한 번에 하나)라 락 불필요 — chat_selection 과 동형.
+channel_sessions: dict[int, str] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -615,6 +629,37 @@ def load_notify_state(path: Path, today: str) -> tuple[set[tuple[str, str]], dic
 def save_notify_state(path: Path, fired: set[tuple[str, str]], snooze: dict[str, str]) -> None:
     """fired·snooze 를 원자적으로 영속(임시파일 write→replace)."""
     payload = {"fired": [[i, d] for i, d in sorted(fired)], "snooze": snooze}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_channel_sessions(path: Path) -> dict[int, str]:
+    """channel_sessions.json → {channel_id: session_id}. 없음·손상은 빈 dict(방어적).
+
+    JSON 객체 키는 문자열이라 int channel_id 로 되돌린다. session_id 는 UUID 형태(_SESSION_ID_RE)만
+    복원해, 손상·주입 값이 --resume argv 로 흘러가는 것을 로드 시점에 차단한다(L-1 방어심층).
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[int, str] = {}
+    for k, v in raw.items():
+        try:
+            cid = int(k)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(v, str) and _SESSION_ID_RE.match(v):
+            out[cid] = v
+    return out
+
+
+def save_channel_sessions(path: Path, sessions: dict[int, str]) -> None:
+    """channel_sessions 를 원자적으로 영속(tmp write→replace, save_notify_state 패턴). 키는 str."""
+    payload = {str(cid): sid for cid, sid in sessions.items()}
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
@@ -1059,6 +1104,10 @@ HELP_TEXT = (
     "토스 캡처를 캡션에 종목을 적어 보내면 우리 값과 대조합니다.\n"
     "`사진 + 캡션: MU`\n"
     "\n"
+    "## 새 대화\n"
+    "명령어 - 새대화 · 리셋 · 새로시작 · /새대화\n"
+    "이 채널의 대화 맥락을 비우고 새 세션으로 시작합니다.\n"
+    "\n"
     "## 선택 취소\n"
     "명령어 - 취소 · /취소 · /cancel\n"
     "대기 중인 선택 입력을 취소합니다.\n"
@@ -1082,6 +1131,7 @@ def run_claude_with_progress(
     timeout: int,
     allowed_tools: list[str] | None = None,
     resume: str | None = None,
+    fallback_notice: str | None = None,
     user_id: int | None = None,
 ) -> dict[str, Any]:
     """진행 메시지(실시간 갱신) → claude 실행 → 최종 결과 회신. data 반환.
@@ -1118,6 +1168,15 @@ def run_claude_with_progress(
     data = run_claude(claude_exe, proj_path, task, timeout, on_event, allowed_tools, resume)
     finished = True  # 이후 on_event 는 즉시 return → 최종 결과 edit 가 스테일 진행에 안 덮인다.
     reply = format_reply(data)
+    # ⑤ 세션 재개가 기계적으로 실패(is_error·session_id 없음 → 호출측이 새 세션으로 곧 재실행)하면
+    # 무서운 "❌처리실패" 대신 이 안내 1줄로 대체해 ❌→✅ 이중 표시를 완화한다. session_id 가 있는
+    # 실제 task 오류는 그대로 노출(재실행 안 함).
+    if (
+        fallback_notice is not None
+        and data.get("is_error")
+        and not isinstance(data.get("session_id"), str)
+    ):
+        reply = fallback_notice
     # ③ 선택지 감지 — full 도구 실행에서만(사진 Read 경로 제외).
     choice = parse_choice_prompt(str(data.get("result", ""))) if allowed_tools is None else None
     if choice is not None:
@@ -1173,6 +1232,17 @@ def _render_choices(
     }
 
 
+def _remember_session(channel_id: int, sid: object) -> None:
+    """결과 session_id(str)를 채널 세션에 반영·영속(⑤) — 값이 실제 바뀔 때만 디스크 쓰기.
+
+    같은 id 재발행이면 no-op(불필요한 write 제거), 바뀌면 정합. resume·버튼·자유입력 경로가
+    공유해 어느 쪽으로 대화가 이어져도 channel_sessions 가 최신 세션을 가리키게 한다.
+    """
+    if isinstance(sid, str) and sid and channel_sessions.get(channel_id) != sid:
+        channel_sessions[channel_id] = sid
+        save_channel_sessions(CHANNEL_SESSIONS_FILE, channel_sessions)
+
+
 def resume_run(
     adapter: Adapter,
     channel_id: int,
@@ -1204,7 +1274,7 @@ def resume_run(
     )
     if data.get("is_error"):
         fallback = f"직전 질문「{question}」의 내 답은 '{answer}'. 그 맥락으로 이어 진행하라."
-        run_claude_with_progress(
+        data = run_claude_with_progress(
             adapter,
             channel_id,
             f"{LEAD_RUN} (재시도) 이어서…",
@@ -1214,6 +1284,62 @@ def resume_run(
             timeout,
             user_id=user_id,
         )
+    # ⑤ 버튼/직접입력 경로도 결과 세션을 채널에 반영 — 이후 자유입력이 이 답변 세션으로 이어진다.
+    _remember_session(channel_id, data.get("session_id"))
+
+
+def _run_with_session(
+    adapter: Adapter,
+    exec_channel_id: int,
+    header: str,
+    claude_exe: str,
+    proj_path: str,
+    task: str,
+    timeout: int,
+    user_id: int | None = None,
+) -> dict[str, Any]:
+    """채널 대화 세션 연속성 래퍼(⑤) — 직전 세션 resume 실행 후 새 session_id 를 영속한다.
+
+    exec_channel_id 의 마지막 세션을 --resume 해 맥락을 잇고(첫 메시지는 resume=None → 새 세션),
+    결과 session_id 를 channel_sessions 에 저장·영속한다. resume 실행이 에러면(세션 없음·만료로
+    --resume 실패) 그 채널 세션을 버리고 깨끗한 새 세션으로 1회 재실행한다 — 사용자가 막히지 않게
+    (맥락요약 재주입은 불필요, ponytail). exec_channel_id 는 진행 스트리밍 채널이자 세션 키다
+    (①② 는 channel_id, ③ 이동은 proj_ch). 오라클·청소·push·사진·버튼 등 비대화 경로는 이 래퍼를
+    쓰지 않아 세션을 캡처하지 않는다.
+    """
+    resume = channel_sessions.get(exec_channel_id)
+    data = run_claude_with_progress(
+        adapter,
+        exec_channel_id,
+        header,
+        claude_exe,
+        proj_path,
+        task,
+        timeout,
+        resume=resume,
+        # 기계적 재개 실패(아래 폴백) 시 "❌처리실패" 대신 이 1줄로 대체 → ❌→✅ 이중회신 완화.
+        fallback_notice=("🔄 이전 대화가 만료돼 새로 시작합니다" if resume is not None else None),
+        user_id=user_id,
+    )
+    # 재개 실패 폴백은 **세션이 서지 못한 기계적 실패**(resume 실패 → synthetic 반환, session_id
+    # 없음)만 새 세션으로 1회 재실행. resume 성공 뒤의 task 오류(max-turns·툴 실패)는 결과 이벤트에
+    # session_id 가 실려 재실행 안 함 — 이미 한 작업의 부작용 중복·이중 회신 방지(🔴1).
+    if resume is not None and data.get("is_error") and not isinstance(data.get("session_id"), str):
+        channel_sessions.pop(exec_channel_id, None)
+        save_channel_sessions(CHANNEL_SESSIONS_FILE, channel_sessions)
+        log.info("chat=%s 세션 재개 실패 — 새 세션으로 재시도", exec_channel_id)
+        data = run_claude_with_progress(
+            adapter,
+            exec_channel_id,
+            header,
+            claude_exe,
+            proj_path,
+            task,
+            timeout,
+            user_id=user_id,
+        )
+    _remember_session(exec_channel_id, data.get("session_id"))
+    return data
 
 
 def _handle_photo(
@@ -1550,6 +1676,13 @@ def _handle_text(
             [Button("🧹 청소", "clean:ok", ""), Button("✖ 취소", "x", "")],
         )
         return
+    if cmd == "/new":
+        # ⑤ 대화 세션 리셋 — 이 채널 세션을 버려 다음 메시지가 새(백지) 세션으로 시작하게 한다.
+        channel_sessions.pop(channel_id, None)
+        save_channel_sessions(CHANNEL_SESSIONS_FILE, channel_sessions)
+        log.info("chat=%s cmd=new 세션 리셋", channel_id)
+        adapter.send(channel_id, "🆕 새 대화를 시작합니다.")
+        return
     # casefold: 폰 자동 대문자화("Push")도 인식. 내부 공백 접기: "푸시 해줘"·"푸시 해"도 push 로
     # (PUSH_WORDS 는 붙여쓰기 유지). parse_message/COMMANDS 는 원문 기준이라 문장 오탐엔 무영향.
     if "".join(stripped.split()).casefold() in PUSH_WORDS:
@@ -1594,9 +1727,9 @@ def _handle_text(
                 # 프로젝트명만 보냄(지시 없음) — 이동 후 선택만 고정하고 안내(버튼 탭과 동일 UX).
                 adapter.send(proj_ch, project_guide(folder))
                 return
-            run_claude_with_progress(
+            _run_with_session(
                 adapter,
-                proj_ch,
+                proj_ch,  # ⑤ 이동 후엔 proj_ch 가 세션 키(그 채널의 연속 대화로 이어짐)
                 f"{LEAD_RUN} [{folder}] 작업 중…",
                 claude_exe,
                 proj_path,
@@ -1606,7 +1739,7 @@ def _handle_text(
             )
             return
         log.info("chat=%s 일반 실행 role=%s", channel_id, event.channel_role)
-        run_claude_with_progress(
+        _run_with_session(
             adapter,
             channel_id,
             f"{LEAD_RUN} 작업 중…",
@@ -1644,7 +1777,7 @@ def _handle_text(
 
     log.info("chat=%s 실행 project=%s", channel_id, project)
     header = f"{LEAD_RUN} [{project}] 작업 중…"
-    data = run_claude_with_progress(
+    data = _run_with_session(
         adapter, channel_id, header, claude_exe, proj_path, task, timeout, user_id=event.user_id
     )
     # git 상태 안내는 올릴 로컬 커밋이 실제 있을 때(ahead>0)만 push 버튼과 함께 보낸다.
@@ -1802,6 +1935,7 @@ def main() -> int:
     _fired, _snooze = load_notify_state(NOTIFY_STATE_FILE, datetime.now(_KST).date().isoformat())
     notify_fired.update(_fired)
     notify_snooze.update(_snooze)
+    channel_sessions.update(load_channel_sessions(CHANNEL_SESSIONS_FILE))  # ⑤ 대화 세션 연속성 복원
 
     # 지연 import: discord.py 는 discord_adapter 에만 격리 — 코어(bridge)를 직접 import 하는
     # 경로(selftest·단위 테스트)는 이 줄에 닿지 않아 discord.py 미설치 환경에서도 죽지 않는다
@@ -1872,6 +2006,10 @@ def _selftest() -> None:
     assert "/restart" in COMMANDS and PLAIN_ALIASES["재시작"] == "/restart"  # 재시작 명령 등록
     assert "/clean" in COMMANDS and PLAIN_ALIASES["청소"] == "/clean"  # 청소 명령 등록
     assert COMMAND_ALIASES["/청소"] == "/clean"
+    assert "/new" in COMMANDS and PLAIN_ALIASES["새대화"] == "/new"  # ⑤ 새대화 리셋 명령 등록
+    assert PLAIN_ALIASES["리셋"] == "/new" and COMMAND_ALIASES["/새대화"] == "/new"
+    # ⑤ 채널 세션 라운드트립 — int 키 복원·UUID 필터(손상 값 드롭).
+    assert load_channel_sessions(PROJECT_DIR / "_nope_sessions.json") == {}
     assert all(parse_message(w) is None for w in PUSH_WORDS)  # bare 별칭은 push 커맨드
     assert parse_message("프로젝트 알려줘") == ("프로젝트", "알려줘")  # 문장은 명령 아님(2단어)
     assert parse_message("기록해주고 푸시해줘") == ("기록해주고", "푸시해줘")  # 문장은 push 아님

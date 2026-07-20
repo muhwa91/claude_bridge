@@ -1708,11 +1708,12 @@ def test_dispatch_skips_send_when_no_alert_channel(notify_env, monkeypatch):
 
 def _spy_rcwp(monkeypatch):
     # run_claude_with_progress(adapter, cid, header, exe, proj, task, timeout …) — proj=4·task=5.
+    # dict 반환(실제 계약) — _run_with_session 이 반환값을 읽으므로 None 을 주면 안 됨.
     runs = []
     monkeypatch.setattr(
         bridge,
         "run_claude_with_progress",
-        lambda *args, **_kw: runs.append((args[4], args[5])),
+        lambda *args, **_kw: runs.append((args[4], args[5])) or {"is_error": False, "result": "ok"},
     )
     return runs
 
@@ -1749,12 +1750,14 @@ def test_general_channel_commands_still_work(monkeypatch, tmp_path):
 
 
 def _spy_rcwp_ch(monkeypatch):
-    # (channel_id, proj, task) 기록 — 이동 실행이 프로젝트 채널로 가는지 검증용.
+    # (channel_id, proj, task) 기록 — 이동 실행이 프로젝트 채널로 가는지 검증. dict 반환(실제 계약).
     runs = []
     monkeypatch.setattr(
         bridge,
         "run_claude_with_progress",
-        lambda *args, **_kw: runs.append((args[1], args[4], args[5])),
+        lambda *args, **_kw: (
+            runs.append((args[1], args[4], args[5])) or {"is_error": False, "result": "ok"}
+        ),
     )
     return runs
 
@@ -2809,3 +2812,223 @@ def test_bare_project_name_pins_selection_without_running(sel_env, monkeypatch, 
     assert sel_env.runs == []
     # 축약 확인 문구: "[데모 라벨]" 한 줄(폴더명·긴 힌트 반복 제거).
     assert any("[데모 라벨]" in t for _c, t, _b in sel_env.sent)
+
+
+# ===========================================================================
+# ⑤ 채널별 대화 세션 연속성(A안) — resume 연결·새대화 리셋·재개실패 폴백·격리·영속
+# ===========================================================================
+
+
+def _sess_spy(monkeypatch, returns):
+    """run_claude_with_progress 스파이 — (channel_id, resume) 기록, returns 순서대로 data 반환."""
+    calls = []
+    it = iter(returns)
+
+    def spy(_a, cid, _hdr, _exe, _proj, _task, _to, resume=None, **_kw):
+        calls.append({"cid": cid, "resume": resume})
+        return next(it)
+
+    monkeypatch.setattr(bridge, "run_claude_with_progress", spy)
+    return calls
+
+
+@pytest.fixture
+def sess_env(monkeypatch, tmp_path):
+    """channel_sessions·chat_selection 격리 + 세션파일 tmp 리다이렉트 + git 노트 억제 + etf_info."""
+    bridge.channel_sessions.clear()
+    bridge.chat_selection.clear()
+    monkeypatch.setattr(bridge, "CHANNEL_SESSIONS_FILE", tmp_path / "cs.json")
+    monkeypatch.setattr(bridge, "git_ahead", lambda _r: 0)  # push 노트 억제(별도 실행 없음)
+    (tmp_path / "etf_info").mkdir()
+    yield
+    bridge.channel_sessions.clear()
+    bridge.chat_selection.clear()
+
+
+@pytest.mark.usefixtures("sess_env")
+def test_channel_session_first_stores_second_resumes(monkeypatch, tmp_path):
+    # 첫 메시지: resume=None → 새 세션, session_id 저장. 둘째: 직전 sid 로 resume, 최신 sid 갱신.
+    calls = _sess_spy(
+        monkeypatch,
+        [
+            {"is_error": False, "result": "ok", "session_id": "sid-aaa"},
+            {"is_error": False, "result": "ok", "session_id": "sid-bbb"},
+        ],
+    )
+    root = str(tmp_path)
+    _fire(
+        FakeAdapter(secrets=[]), _txt(777, "etf_info 첫 지시"), repo_root=tmp_path, target_root=root
+    )
+    assert calls[0]["resume"] is None
+    assert bridge.channel_sessions[777] == "sid-aaa"
+    _fire(
+        FakeAdapter(secrets=[]), _txt(777, "etf_info 이어서"), repo_root=tmp_path, target_root=root
+    )
+    assert calls[1]["resume"] == "sid-aaa"  # 둘째 메시지는 직전 세션 resume
+    assert bridge.channel_sessions[777] == "sid-bbb"  # 최신 세션으로 갱신
+
+
+@pytest.mark.usefixtures("sess_env")
+def test_new_command_resets_session(monkeypatch, tmp_path):
+    # 새대화 → 세션 pop + 안내 · claude 미실행 · 이후 실행은 resume=None(새 세션).
+    calls = _sess_spy(
+        monkeypatch,
+        [
+            {"is_error": False, "result": "ok", "session_id": "sid-aaa"},
+            {"is_error": False, "result": "ok", "session_id": "sid-ccc"},
+        ],
+    )
+    root = str(tmp_path)
+    _fire(
+        FakeAdapter(secrets=[]), _txt(777, "etf_info 첫 지시"), repo_root=tmp_path, target_root=root
+    )
+    assert bridge.channel_sessions[777] == "sid-aaa"
+    reset_fa = FakeAdapter(secrets=[])
+    _fire(reset_fa, _txt(777, "새대화"), repo_root=tmp_path, target_root=root)
+    assert 777 not in bridge.channel_sessions  # 세션 초기화
+    assert any("새 대화" in t for _c, t, _b in reset_fa.sent)
+    assert len(calls) == 1  # 새대화는 claude 실행 아님
+    _fire(FakeAdapter(secrets=[]), _txt(777, "etf_info 다시"), repo_root=tmp_path, target_root=root)
+    assert calls[1]["resume"] is None  # 리셋 후 새 세션
+
+
+@pytest.mark.usefixtures("sess_env")
+def test_channel_sessions_isolated_per_channel(monkeypatch, tmp_path):
+    # 서로 다른 채널ID 는 독립 세션 — 채널 100 은 자기 세션만 이어받는다.
+    calls = _sess_spy(
+        monkeypatch,
+        [
+            {"is_error": False, "result": "ok", "session_id": "sid-100"},
+            {"is_error": False, "result": "ok", "session_id": "sid-200"},
+            {"is_error": False, "result": "ok", "session_id": "sid-100b"},
+        ],
+    )
+    root = str(tmp_path)
+    _fire(
+        FakeAdapter(secrets=[]),
+        _txt(777, "etf_info a", channel_id=100),
+        repo_root=tmp_path,
+        target_root=root,
+    )
+    _fire(
+        FakeAdapter(secrets=[]),
+        _txt(777, "etf_info b", channel_id=200),
+        repo_root=tmp_path,
+        target_root=root,
+    )
+    _fire(
+        FakeAdapter(secrets=[]),
+        _txt(777, "etf_info c", channel_id=100),
+        repo_root=tmp_path,
+        target_root=root,
+    )
+    assert bridge.channel_sessions[100] == "sid-100b"
+    assert bridge.channel_sessions[200] == "sid-200"
+    assert calls[2]["resume"] == "sid-100"  # 채널 100 셋째 실행은 채널 100 의 첫 세션 이어받음
+
+
+@pytest.mark.usefixtures("sess_env")
+def test_channel_session_move_stores_under_proj_ch(monkeypatch, tmp_path):
+    # 간단처리→프로젝트 이동(③) 세션은 원채널이 아니라 proj_ch 키로 저장된다.
+    (tmp_path / "trading_info").mkdir()
+    calls = _sess_spy(monkeypatch, [{"is_error": False, "result": "ok", "session_id": "sid-move"}])
+    a = FakeAdapter(secrets=[], projects={"trading_info": 555})
+    ev = Event(
+        kind="text",
+        channel_id=100,
+        user_id=777,
+        text="trading_info 로그 봐줘",
+        channel_role="간단처리",
+    )
+    _fire(a, ev, repo_root=tmp_path, target_root=str(tmp_path))
+    assert bridge.channel_sessions == {555: "sid-move"}  # proj_ch(555) 키, 원채널 100 아님
+    assert calls[0]["cid"] == 555 and calls[0]["resume"] is None
+
+
+@pytest.mark.usefixtures("sess_env")
+def test_channel_session_resume_error_falls_back_to_new(monkeypatch, tmp_path):
+    # 만료 세션 resume 이 에러 → 세션 버리고 새 세션으로 1회 재실행, 새 sid 저장(막히지 않음).
+    bridge.channel_sessions[777] = "sid-stale"
+    calls = _sess_spy(
+        monkeypatch,
+        [
+            {"is_error": True, "result": "세션 없음"},  # resume 실패
+            {"is_error": False, "result": "ok", "session_id": "sid-new"},  # 새 세션 성공
+        ],
+    )
+    _fire(
+        FakeAdapter(secrets=[]),
+        _txt(777, "etf_info 이어서"),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert calls[0]["resume"] == "sid-stale"  # 1차: 만료 세션 resume 시도
+    assert calls[1]["resume"] is None  # 2차: 깨끗한 새 세션
+    assert bridge.channel_sessions[777] == "sid-new"  # 새 세션 저장
+
+
+def test_channel_sessions_load_save_roundtrip(tmp_path):
+    # 영속 라운드트립 + int 키 복원 · 비-UUID/비-int 값 드롭 · 없음은 빈 dict.
+    p = tmp_path / "cs.json"
+    bridge.save_channel_sessions(p, {100: "a1b2c3d4-0000", 200: "ffffffff"})
+    assert bridge.load_channel_sessions(p) == {100: "a1b2c3d4-0000", 200: "ffffffff"}
+    p.write_text('{"5": "not a uuid!!!", "x": "aaaaaaaa"}', encoding="utf-8")
+    assert bridge.load_channel_sessions(p) == {}  # 비-UUID 값·비-int 키 드롭
+    assert bridge.load_channel_sessions(tmp_path / "none.json") == {}  # 파일 없음
+
+
+@pytest.mark.usefixtures("sess_env")
+def test_channel_session_task_error_with_sid_no_rerun(monkeypatch, tmp_path):
+    # 🔴1 이중 실행 방지: resume 성공 후 task 오류(session_id 있음)면 재실행 안 함(1회) + 그 세션
+    # 유지. _sess_spy 는 returns 를 1개만 줘, 2회째 호출 시 StopIteration 으로 실패 → 가드 실효성.
+    bridge.channel_sessions[777] = "sid-prev"
+    calls = _sess_spy(
+        monkeypatch, [{"is_error": True, "result": "작업 오류", "session_id": "sid-prev"}]
+    )
+    _fire(
+        FakeAdapter(secrets=[]),
+        _txt(777, "etf_info 이어서"),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert len(calls) == 1  # 재실행 없음(부작용 중복·이중 회신 방지)
+    assert calls[0]["resume"] == "sid-prev"
+    assert bridge.channel_sessions[777] == "sid-prev"  # 그 세션 유지(대화 이어짐)
+
+
+@pytest.mark.usefixtures("sess_env")
+def test_resume_run_updates_channel_session(monkeypatch):
+    # 🟡2 버튼/직접입력 답변(resume_run) 후 채널 세션이 결과 session_id 로 갱신 → 이후 자유입력이
+    # 버튼답변 세션으로 이어진다(맥락 유실 방지).
+    bridge.channel_sessions[777] = "sid-old"
+    _sess_spy(monkeypatch, [{"is_error": False, "result": "ok", "session_id": "sid-btn"}])
+    bridge.resume_run(FakeAdapter(secrets=[]), 777, "claude", "/p", "답", "질문", "sid-old", 60)
+    assert bridge.channel_sessions[777] == "sid-btn"
+
+
+def test_rcwp_fallback_notice_replaces_mechanical_error(monkeypatch):
+    # 🟢3 기계적 재개 실패(is_error·session_id 없음)면 최종 회신을 무서운 "❌처리실패" 대신 안내
+    # 1줄로 대체(호출측이 곧 새 세션 재실행) — ❌→✅ 이중 표시 완화.
+    monkeypatch.setattr(
+        bridge, "run_claude", lambda *_a, **_k: {"is_error": True, "result": "세션을 찾을 수 없음"}
+    )
+    fa = FakeAdapter(secrets=[], send_ids=[10])
+    bridge.run_claude_with_progress(
+        fa, 777, "H", "c", "/p", "task", 60, resume="sid-x", fallback_notice="🔄 새로 시작합니다"
+    )
+    assert fa.edited[-1][2] == "🔄 새로 시작합니다"
+    assert "처리실패" not in fa.edited[-1][2]
+
+
+def test_rcwp_fallback_notice_kept_when_session_present(monkeypatch):
+    # 🟢3 반대편: session_id 가 있는 실제 task 오류엔 안내로 덮지 않고 실패문을 그대로 노출.
+    monkeypatch.setattr(
+        bridge,
+        "run_claude",
+        lambda *_a, **_k: {"is_error": True, "result": "진짜 오류", "session_id": "sid-1"},
+    )
+    fa = FakeAdapter(secrets=[], send_ids=[10])
+    bridge.run_claude_with_progress(
+        fa, 777, "H", "c", "/p", "task", 60, resume="sid-1", fallback_notice="🔄 새로"
+    )
+    assert "진짜 오류" in fa.edited[-1][2] and "🔄 새로" not in fa.edited[-1][2]
