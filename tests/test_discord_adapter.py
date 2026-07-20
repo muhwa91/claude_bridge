@@ -69,7 +69,7 @@ def test_render_view_choice_and_notify_custom_ids():
 
 def test_render_view_custom_id_within_discord_100_char_limit():
     # §1.3: DC custom_id ≤100자. id·name≤64 라 인코드 결과가 한도 안(캡은 오작동 없이 무시로 안전).
-    from telegram_adapter import encode_callback
+    from adapter import encode_callback
 
     for action, arg in (
         ("push", ""),
@@ -335,6 +335,11 @@ def test_send_masks_secrets():
     assert calls[0][2] == "token=*** 노출"
 
 
+def test_render_parts_empty_body_uses_placeholder():
+    # 디스코드는 빈 content 를 400 거부 → _render_parts 가 "(빈 응답)" 로 방어.
+    assert _adapter()._render_parts("") == ["(빈 응답)"]
+
+
 def test_send_chunks_buttons_on_last_only():
     a = _adapter(limit=5)
     calls = _stub_calls(a, [10, 20, 30])
@@ -364,56 +369,6 @@ def test_edit_single_chunk_keeps_buttons_on_head():
     assert len(calls) == 1
     assert calls[0][0] == "edit"
     assert calls[0][4] is not None  # 단일 청크 → head 에 버튼
-
-
-# ---------------------------------------------------------------------------
-# notify(H-1): 허용 user_id → DM 발송(send=채널 전용과 분리)
-# ---------------------------------------------------------------------------
-def test_notify_routes_to_dm_send_coro_not_channel():
-    a = _adapter()
-    calls = []
-    a._dm_send_coro = lambda uid, body, view: ("dm", uid, body, view)  # type: ignore[assignment]
-    a._send_coro = lambda cid, body, view: ("send", cid, body, view)  # type: ignore[assignment]
-
-    def fake_run(coro):
-        calls.append(coro)
-        return 55
-
-    a._run = fake_run  # type: ignore[assignment]
-    mid = a.notify(777, "⏰ 알림", [Button("✅", "nb:ok", "a")])
-    assert mid == 55
-    assert calls[0][0] == "dm" and calls[0][1] == 777  # 채널(send)이 아니라 DM 경로
-    assert calls[0][3] is not None  # 단일 청크 → 버튼 부착
-
-
-def test_notify_masks_secrets():
-    a = _adapter(secrets=["SECRET"])
-    calls = []
-    a._dm_send_coro = lambda uid, body, view: ("dm", uid, body, view)  # type: ignore[assignment]
-    a._run = lambda coro: calls.append(coro)  # type: ignore[assignment]
-    a.notify(777, "token=SECRET 노출")
-    assert calls[0][2] == "token=*** 노출"
-
-
-def test_dm_send_coro_resolves_user_to_dm_channel():
-    # H-1: user_id → get_user(캐시) → create_dm → send. 채널 해석을 DM 으로.
-    a = _adapter()
-    sent = {}
-
-    class _DM:
-        async def send(self, content=None, *, view=None, **_kw):  # embed 등은 무시
-            sent["body"], sent["view"] = content, view
-            return SimpleNamespace(id=999)
-
-    class _User:
-        dm_channel = None
-
-        async def create_dm(self):
-            return _DM()
-
-    a._client.get_user = lambda uid: _User() if uid == 777 else None  # type: ignore[assignment]
-    mid = asyncio.run(a._dm_send_coro(777, "본문", None))
-    assert mid == 999 and sent["body"] == "본문"
 
 
 # ---------------------------------------------------------------------------
@@ -580,11 +535,10 @@ def test_edit_progress_to_done_transitions_embed_same_message():
 
 
 def test_notify_status_renders_yellow_embed():
+    # 예약 알림(⏰ 선두 이모지) → 진행/대기 노랑 임베드. #알림 채널 send 경로로 검증.
     a = _adapter()
-    calls = []
-    a._dm_send_coro = lambda uid, payload, view: ("dm", uid, payload, view)  # type: ignore[assignment]
-    a._run = lambda coro: calls.append(coro)  # type: ignore[assignment]
-    a.notify(777, "⏰ 개장 알림\n등락률 확인", [Button("✅ 확인시작", "nb:ok", "a")])
+    calls = _stub_calls(a, [1])
+    a.send(999, "⏰ 개장 알림\n등락률 확인", [Button("✅ 확인시작", "nb:ok", "a")])
     payload = calls[0][2]
     assert isinstance(payload, discord.Embed)
     assert payload.color.value == discord_adapter._COLOR_WAIT
@@ -660,6 +614,49 @@ def test_setup_channels_stores_names():
     a = _adapter()
     a.setup_channels(["a", "b"])
     assert a._project_names == ["a", "b"]
+
+
+# ---------------------------------------------------------------------------
+# clear_channel / _purge_coro — 채널 메시지 전체 삭제(파괴적, 부분 성공 허용)
+# ---------------------------------------------------------------------------
+def test_clear_channel_delegates_to_run_and_defaults_zero():
+    a = _adapter()
+    a._run = lambda coro: (coro.close(), 7)[1]  # type: ignore[assignment]  # 코루틴 닫고 카운트
+    assert a.clear_channel(100) == 7
+    a._run = lambda coro: (coro.close(), None)[1]  # type: ignore[assignment]  # 루프 미준비 폴백
+    assert a.clear_channel(100) == 0
+
+
+def test_purge_coro_loops_until_exhausted():
+    a = _adapter()
+    batches = [[object()] * 100, [object()] * 30]  # 100 → 30(<100)에서 종료
+    calls = []
+
+    class _Ch:
+        async def purge(self, *, limit, bulk):
+            calls.append((limit, bulk))
+            return batches[len(calls) - 1] if len(calls) <= len(batches) else []
+
+    a._client.get_channel = lambda _cid: _Ch()  # type: ignore[assignment]
+    assert asyncio.run(a._purge_coro(100)) == 130
+    assert len(calls) == 2 and calls[0] == (100, True)
+
+
+def test_purge_coro_partial_failure_returns_deleted_count():
+    a = _adapter()
+
+    class _Ch:
+        def __init__(self):
+            self.n = 0
+
+        async def purge(self, **_kw):
+            self.n += 1
+            if self.n == 1:
+                return [object()] * 100
+            raise discord.DiscordException("boom")  # 권한 없음·API 오류 모사
+
+    a._client.get_channel = lambda _cid: _Ch()  # type: ignore[assignment]
+    assert asyncio.run(a._purge_coro(100)) == 100  # 부분 성공: 삭제된 만큼만
 
 
 def test_message_event_channel_map_project_and_role():
@@ -799,8 +796,8 @@ def test_concurrent_on_ready_no_duplicate(monkeypatch):
         await asyncio.gather(a._ensure_channels(), a._ensure_channels())
 
     asyncio.run(two_on_ready())
-    # 카테고리 5개(중복 X), etf_info 채널 1회만 생성.
-    assert len(guild.categories) == 5
+    # 카테고리 6개(중복 X), etf_info 채널 1회만 생성.
+    assert len(guild.categories) == 6
     assert [n for n, _ in guild.created].count("etf_info") == 1
 
 
@@ -856,7 +853,8 @@ def test_project_channel_renamed_to_label_via_map(monkeypatch):
     asyncio.run(a._ensure_channels())
     assert ch.renames == ["주식모니터링"]  # 공백 제거 붙여쓰기명으로 리네임
     assert a._channel_map[500] == ("project", "trading_info")  # 매핑=폴더명 불변(라우팅)
-    assert not any("주식" in n or n == "trading_info" for n, _ in guild.created)  # 재생성 X
+    # 재생성 X — 정확명 비교(부분일치 '주식' 금지: 미국주식 무관)
+    assert not any(n in ("주식모니터링", "trading_info") for n, _ in guild.created)
 
 
 def test_label_rename_idempotent_second_run(monkeypatch):
@@ -976,8 +974,40 @@ def test_categories_ordered(monkeypatch):
     assert order["간단처리"] == 0
     assert order["프로젝트"] == 1
     assert order["데이터분석"] == 2
-    assert order["시스템"] == 3
-    assert order["playlist"] == 4  # 🎵 PlayList
+    assert order["스케쥴러"] == 3  # 🗓️ 스케쥴러 (데이터분석 아래·시스템 위)
+    assert order["시스템"] == 4
+    assert order["playlist"] == 5  # 🎵 PlayList
+
+
+def test_scheduler_category_in_order_between_data_and_system():
+    # 🗓️ 스케쥴러 = _CAT_ORDER index 3(데이터분석 아래·시스템 위).
+    order = discord_adapter._CAT_ORDER
+    assert order.index(discord_adapter._CAT_SCHED) == 3
+    assert order[2] == discord_adapter._CAT_DATA
+    assert order[4] == discord_adapter._CAT_SYSTEM
+    assert discord_adapter._CAT_ALIASES[discord_adapter._CAT_SCHED] == ["스케쥴러"]
+
+
+def test_scheduler_special_has_two_role_channels():
+    assert discord_adapter._SPECIAL[discord_adapter._CAT_SCHED] == [
+        ("미국주식", "role", "미국주식"),
+        ("오픈소스", "role", "오픈소스"),
+    ]
+
+
+def test_scheduler_channels_created_and_mapped(monkeypatch):
+    # 새 카테고리 🗓️ 스케쥴러 아래에 미국주식·오픈소스 role 채널 생성 + channel_map 매핑.
+    monkeypatch.setattr(discord_adapter, "PROJECT_LABELS", {})
+    a = DiscordAdapter("tok", [], _ALLOWED)
+    a.setup_channels([])
+    guild = _guild_for(a)
+    asyncio.run(a._ensure_channels())
+    tags = set(a._channel_map.values())
+    assert ("role", "미국주식") in tags and ("role", "오픈소스") in tags
+    created = {n for n, _ in guild.created}
+    assert {"미국주식", "오픈소스"} <= created
+    assert a.role_channel("미국주식") is not None and a.role_channel("오픈소스") is not None
+    assert any(discord_adapter._cat_core(c.name) == "스케쥴러" for c in guild.categories)
 
 
 def test_categories_created_with_emoji(monkeypatch):

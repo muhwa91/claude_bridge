@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""claude_bridge — 채팅 메시지로 Claude Code 작업을 원격 트리거하는 브리지(플랫폼 무관 코어).
+"""claude_bridge — 디스코드에서 보낸 한 줄로 Claude Code 작업을 원격 실행하는 브리지(코어).
 
-Python 3.13 표준 라이브러리만 사용(외부 패키지 0). 플랫폼(텔레그램/디스코드) 종속은 `Adapter`
-계층(adapter.py·telegram_adapter.py)이 흡수하고, 이 코어는 정규화 `Event`/`Button` 과 6메서드만
-다룬다. 단일 워커가 이벤트를 직렬 처리한다: 인증 → 파싱 → 프로젝트 해석 → claude 실행 → 회신.
-`push` 승인 시에만 모노레포 루트에서 pull --rebase 후 push 한다.
+코어는 표준 라이브러리만 쓴다(외부 패키지 0). 플랫폼 종속은 `Adapter` 계층(adapter.py·
+discord_adapter.py)이 흡수하고, 이 코어는 정규화 `Event`/`Button` 과 계약 메서드만 다룬다 —
+플랫폼 교체 seam(현재 구현: 디스코드). 단일 워커가 이벤트를 직렬 처리한다: 인증 → 파싱 →
+프로젝트 해석 → claude 실행 → 회신. `push` 승인 시에만 모노레포 루트에서 pull --rebase 후 push.
 
 보안 경계:
 - user_id 허용목록 필수. 미허용 이벤트는 무회신·로그만.
@@ -35,18 +35,16 @@ from pathlib import Path
 from typing import Any
 
 from adapter import Adapter, Button, Event, _valid_id, mask_secrets
-from telegram_adapter import TelegramAdapter
 
 # ── 경로 상수 ──────────────────────────────────────────────────────────────
 PROJECT_DIR = Path(__file__).resolve().parent
 LOG_DIR = PROJECT_DIR / "logs"
 LOG_FILE = LOG_DIR / "bridge.log"
-OFFSET_FILE = LOG_DIR / "offset"
 PID_FILE = LOG_DIR / "bridge.pid"
 SCHEDULES_FILE = PROJECT_DIR / "schedules" / "notify.json"
 NOTIFY_STATE_FILE = LOG_DIR / "notify_state.json"
 RESTART_NOTICE_FILE = LOG_DIR / "restart_notice.json"  # '재시작' 요청 chat — 재기동 후 복귀 통지용
-CHANNEL_MAP_FILE = LOG_DIR / "channel_map.json"  # DC channelID→(kind,tag) 매핑(자동생성 §4.4)
+CHANNEL_MAP_FILE = LOG_DIR / "channel_map.json"  # channelID→(kind,tag) 매핑(자동생성 §4.4)
 PHOTO_DIR = LOG_DIR / "photos"
 
 # ① 시각 알림용 상수. now·요일 판정은 항상 KST 기준(스케줄 at 은 KST HH:MM).
@@ -81,6 +79,7 @@ COMMAND_ALIASES = {
     "/프로젝트": "/projects",
     "/취소": "/cancel",
     "/재시작": "/restart",
+    "/청소": "/clean",
 }
 # 평문 별칭(슬래시 없이) — PUSH_WORDS 처럼 strip+casefold 단독 정확매칭. 문장 속 단어는 미발동
 # (routing 이 stripped 전체를 대조하므로 "취소 좀 해줘"·"프로젝트 알려줘"는 명령 아님).
@@ -90,10 +89,11 @@ PLAIN_ALIASES = {
     "사용법": "/help",
     "취소": "/cancel",
     "재시작": "/restart",
+    "청소": "/clean",
 }
 # 별칭(슬래시·평문)도 COMMANDS 에 넣어 parse_message 가 이들을 프로젝트명으로 오해하지 않게 한다.
 COMMANDS = (
-    frozenset({"/help", "/start", "/projects", "/cancel", "/restart"})
+    frozenset({"/help", "/start", "/projects", "/cancel", "/restart", "/clean"})
     | frozenset(COMMAND_ALIASES)
     | frozenset(PLAIN_ALIASES)
     | PUSH_WORDS
@@ -328,7 +328,7 @@ def choice_buttons(msg_id: int, choices: list[tuple[str, str]]) -> list[Button]:
 
 
 def load_schedules(path: Path) -> list[dict[str, Any]]:
-    """notify.json → items 리스트. 파일 없음·손상은 빈 리스트(offset·env 로더처럼 방어적).
+    """notify.json → items 리스트. 파일 없음·손상은 빈 리스트(load_env 로더처럼 방어적).
 
     timezone 필드는 향후 확장용 예약 — 현재는 _KST(Asia/Seoul) 고정이라 읽지 않는다(YAGNI).
     id 가 안전 규칙(_valid_id) 위반인 항목은 조용히 skip(로더 방어 스타일 — callback 계약 보호).
@@ -556,7 +556,7 @@ def load_notify_state(path: Path, today: str) -> tuple[set[tuple[str, str]], dic
     """notify_state.json → (fired, snooze). 오늘 날짜 항목만 유지(지난 날짜는 정리).
 
     형식: {"fired": [["id","YYYY-MM-DD"], ...], "snooze": {"id": "<ISO datetime KST>"}}.
-    파일 없음·손상은 (빈 set, 빈 dict) 방어적 폴백(offset 로더와 동일).
+    파일 없음·손상은 (빈 set, 빈 dict) 방어적 폴백(load_env 로더와 동일).
     """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -587,7 +587,7 @@ def load_notify_state(path: Path, today: str) -> tuple[set[tuple[str, str]], dic
 
 
 def save_notify_state(path: Path, fired: set[tuple[str, str]], snooze: dict[str, str]) -> None:
-    """fired·snooze 를 원자적으로 영속(offset 저장과 동일: 임시파일 write→replace)."""
+    """fired·snooze 를 원자적으로 영속(임시파일 write→replace)."""
     payload = {"fired": [[i, d] for i, d in sorted(fired)], "snooze": snooze}
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -596,17 +596,16 @@ def save_notify_state(path: Path, fired: set[tuple[str, str]], snooze: dict[str,
 
 def dispatch_notifications(
     adapter: Adapter,
-    allowed: frozenset[int],
     items: list[dict[str, Any]],
 ) -> None:
-    """주기 틱(≤NOTIFY_TICK_SEC) 호출 — 발송할 알림이 있으면 허용 user 전체에게 알림 발송한다.
+    """주기 틱(≤NOTIFY_TICK_SEC) 호출 — 발송할 알림이 있으면 #알림 채널로 발송한다.
 
     스케줄 due + 스누즈 due 를 합쳐 발송하고 notify_fired 에 (id, 날짜)를 기록,
     스누즈는 1회 발송 후 해제한다. 날짜가 바뀌면 지난 fired 를 정리한다. 상태 조회·변이는
     _notify_lock 아래에서 원자적으로(타이머 스레드↔워커 경합 방지), 실제 전송은 락 밖에서 한다.
 
-    DM 폐기(§4.4): DC 는 #알림 채널(role_channel("알림"))로 send — 채널 1곳에 1회. 채널 매핑이
-    없으면(TG·자동생성 실패) `adapter.notify(user_id, ...)` 로 폴백해 허용 user 1:1 에 발송한다.
+    발송 타겟(§4.4): #알림 채널(role_channel("알림"))로 send — 채널 1곳에 1회. 채널 매핑이
+    없으면(자동생성 실패) 발송을 스킵한다(디스코드는 채널로만 발송 — 유저별 팬아웃 없음).
     """
     now = datetime.now(_KST)
     today = now.date().isoformat()
@@ -630,13 +629,14 @@ def dispatch_notifications(
             notify_fired.add((item_id, today))
             notify_snooze.pop(item_id, None)
         save_notify_state(NOTIFY_STATE_FILE, notify_fired, notify_snooze)
-    alert_ch = adapter.role_channel("알림")  # DC #알림 채널ID(없으면 None → TG notify 폴백)
+    alert_ch = adapter.role_channel("알림")  # #알림 채널ID(없으면 None → 발송 스킵)
+    if alert_ch is None:
+        # ponytail: 자동생성 성공 시 #알림은 항상 있다. 없으면 degraded — 스킵(채널 발송만).
+        if outgoing:
+            log.warning("#알림 채널 미매핑 — 알림 %d건 발송 스킵", len(outgoing))
+        return
     for item_id, text in outgoing:
-        if alert_ch is not None:
-            adapter.send(alert_ch, text, notify_buttons(item_id))  # DC: #알림 채널 1회
-        else:
-            for user_id in allowed:  # TG 폴백: 허용 user 1:1(notify=send(chat))
-                adapter.notify(user_id, text, notify_buttons(item_id))
+        adapter.send(alert_ch, text, notify_buttons(item_id))  # #알림 채널 1회
 
 
 def list_projects(target_root: str) -> list[str]:
@@ -968,10 +968,10 @@ def pop_restart_notice(path: Path) -> int | None:
 def _restart(adapter: Adapter, channel_id: int, user_id: int) -> None:
     """재시작 명령: 마커 기록 → 어댑터 정리(close) → 프로세스 종료(exit 0). 런처/systemd 재기동.
 
-    마커(save_restart_notice)는 재기동 후 이 chat 에 '✅ 재시작 완료'를 통지하려고 남긴다. close()
-    는 TG offset 커서를 flush 해 재시작 메시지 재수신(무한 재시작 루프)을 막고, DC 는 Gateway/루프를
-    정리한다. 진행 중 claude 실행이 있어도 강제 종료 수용(개인용 자기수정 루프 — 드레이닝 과설계
-    금지). 회신은 호출측이 exit 전에 이미 보냈다(멱등 close 라 main finally 와 이중 안전).
+    마커(save_restart_notice)는 재기동 후 이 채널에 '✅ 재시작 완료'를 통지하려고 남긴다. close()
+    가 Gateway/이벤트루프를 정리한다. 진행 중 claude 실행이 있어도 강제 종료 수용(개인용 자기수정
+    루프 — 드레이닝 과설계 금지). 회신은 호출측이 exit 전에 이미 보냈다(멱등 close 라 main finally
+    와 이중 안전).
     """
     save_restart_notice(RESTART_NOTICE_FILE, channel_id, user_id)
     log.info("재시작 요청 — 마커 기록·어댑터 정리 후 종료(exit 0)")
@@ -984,8 +984,6 @@ def _restart(adapter: Adapter, channel_id: int, user_id: int) -> None:
 # ══════════════════════════════════════════════════════════════════════════
 # §4.8 목업 CASE6(폰 실측 반영): 섹션 제목 `## `(디스코드 큰 헤더), 명령어는 제목 다음 줄
 # `명령어 - …`, 부가 힌트는 `-# ` 서브텍스트(작은 회색)로 위계 분리. 한글 명령 주력·영어 별칭 병기.
-# TG 는 plain 이라 `##`·`-#` 기호가 그대로 노출되지만 곧 제거될 플랫폼이라 디스코드 가독성 우선
-# (어댑터별 후처리 분기 없이 단일 문자열 — 최소 복잡도).
 HELP_TEXT = (
     "## 작업 실행\n"
     "프로젝트를 고르고 자유롭게 지시하세요.\n"
@@ -1007,6 +1005,10 @@ HELP_TEXT = (
     "## 선택 취소\n"
     "명령어 - 취소 · /취소 · /cancel\n"
     "대기 중인 선택 입력을 취소합니다.\n"
+    "\n"
+    "## 채널 청소\n"
+    "명령어 - 청소 · /청소\n"
+    "확인 후 이 채널의 메시지를 전부 삭제합니다(되돌릴 수 없음).\n"
     "\n"
     "## 도움말\n"
     "명령어 - 도움말 · 사용법 · /도움말 · /help"
@@ -1276,6 +1278,15 @@ def _handle_button(
             adapter.edit(channel_id, message_id, "취소했습니다.")
         else:
             adapter.send(channel_id, "취소했습니다.")
+    elif action == "clean:ok":
+        # 청소 확인 탭 → 채널 메시지 전체 삭제. purge 가 이 확인 메시지까지 지우므로 message_id
+        # 를 edit 하지 말고(사라진 메시지 편집=실패), 삭제 후 새 메시지를 send 한다.
+        log.info("chat=%s callback clean:ok", channel_id)
+        n = adapter.clear_channel(channel_id)
+        if n > 0:
+            adapter.send(channel_id, f"🧹 {n}개 삭제 완료.")
+        else:
+            adapter.send(channel_id, "삭제할 메시지가 없거나 지원하지 않습니다.")
     elif action == "nb:ok":
         # 확인시작 = 예약 점검을 실제 실행. 알림 항목(id=arg)을 재로드해 project·note 로
         # 헤드리스 claude 점검을 돌린다(자동수정 금지 — build_notify_check_prompt).
@@ -1290,7 +1301,7 @@ def _handle_button(
         proj_path = resolve_project(proj_name, target_root) if item else None
         if item is not None and note and proj_path is not None:
             # #알림 채널이 실행 로그로 지저분해지지 않게, 실제 점검은 프로젝트 채널로 스트리밍한다.
-            # 프로젝트 채널이 없으면(TG·미매핑) 현 채널로 폴백(회귀 없음).
+            # 프로젝트 채널이 없으면(미매핑) 현 채널로 폴백(회귀 없음).
             exec_ch = adapter.project_channel(proj_name)
             if isinstance(message_id, int):
                 if exec_ch is not None and exec_ch != channel_id:
@@ -1451,7 +1462,7 @@ def _handle_text(
         adapter.send(channel_id, HELP_TEXT)
         return
     if cmd == "/projects":
-        # §4.3: 버튼이 곧 목록 — 헤더 텍스트 없이 버튼만(DC V2 는 TextDisplay 생략, TG 는 최소).
+        # §4.3: 버튼이 곧 목록 — 헤더 텍스트 없이 버튼만(디스코드 V2 는 TextDisplay 로 흡수).
         names = list_projects(target_root)
         log.info("chat=%s cmd=/projects count=%d", channel_id, len(names))
         adapter.send(channel_id, "", project_buttons(names))
@@ -1477,6 +1488,15 @@ def _handle_text(
         adapter.send(channel_id, "♻️ 재시작합니다…")
         _restart(adapter, channel_id, event.user_id)
         return  # 도달하지 않음(_restart 가 exit) — 방어적
+    if cmd == "/clean":
+        # 파괴적: 바로 삭제하지 않고 확인 버튼을 거친다(clean:ok 탭 시 _handle_button 에서 실행).
+        log.info("chat=%s cmd=clean 확인요청", channel_id)
+        adapter.send(
+            channel_id,
+            "🧹 이 채널의 메시지를 전부 삭제할까요?\n되돌릴 수 없습니다.",
+            [Button("🧹 청소", "clean:ok", ""), Button("✖ 취소", "x", "")],
+        )
+        return
     # casefold: 폰 자동 대문자화("Push")도 인식. 내부 공백 접기: "푸시 해줘"·"푸시 해"도 push 로
     # (PUSH_WORDS 는 붙여쓰기 유지). parse_message/COMMANDS 는 원문 기준이라 문장 오탐엔 무영향.
     if "".join(stripped.split()).casefold() in PUSH_WORDS:
@@ -1506,8 +1526,8 @@ def _handle_text(
 
     # ④ 선택 고정 해석: 첫 단어가 유효 프로젝트면 명시 우선, 아니면 채널 선택으로 실행.
     # §1.4: 디스코드는 채널명을 event.project 로 채운다 — 실존 프로젝트면 "채널=프로젝트" UX 로
-    # chat_selection 보다 우선한다. 텔레그램(project=None)·일반 채널(비프로젝트명)은 검증에서
-    # 걸러져 기존 chat_selection 경로와 100% 동일(새 매칭 규칙 없음 — resolve_project 규약 그대로).
+    # chat_selection 보다 우선한다. project 미설정(DM)·일반 채널(비프로젝트명)은 검증에서 걸러져
+    # 기존 chat_selection 경로와 100% 동일(새 매칭 규칙 없음 — resolve_project 규약 그대로).
     selected = chat_selection.get(channel_id)
     if event.project and resolve_project(event.project, target_root) is not None:
         selected = event.project
@@ -1559,9 +1579,8 @@ def handle_event(
 ) -> None:
     """정규화 Event 통합 디스패처(구 handle_update/handle_callback/handle_photo).
 
-    인가 게이트(최우선): event.user_id 허용목록 대조 — 미허용은 무회신·로그만(§3.1). TG 는 1:1
-    이라 user_id==channel_id 로 기존 chat.id 게이트와 동작 동일. 이후 kind 분기. 코어는
-    adapter.send/edit/ack/fetch_file 만 호출(플랫폼 API 직접 호출 없음).
+    인가 게이트(최우선): event.user_id 허용목록 대조 — 미허용은 무회신·로그만(§3.1). 이후 kind
+    분기. 코어는 adapter.send/edit/ack/fetch_file 만 호출(플랫폼 API 직접 호출 없음).
     """
     if not is_allowed(event.user_id, allowed):
         log.warning("미허용 user_id=%s %s 무시", event.user_id, event.kind)
@@ -1606,29 +1625,28 @@ def setup_logging() -> None:
 
 
 def _notify_restart_done(adapter: Adapter, channel_id: int) -> None:
-    """재기동 후 '✅ 재시작 완료'를 1회 send. DC 는 on_ready 대기 후 #봇-상태 채널로(DM 폐기 §4.4).
+    """재기동 후 '✅ 재시작 완료'를 1회 send. on_ready 대기 후 #봇-상태 채널로 보낸다(DM 폐기 §4.4).
 
-    타겟: DC = role_channel("봇상태") 고정 · TG(채널 없음) = 마커의 요청 chat(channel_id) 폴백.
-    wait_ready 는 DC 만의 얇은 훅(getattr 선택 호출 — TG 는 동기). send 실패해도 무해 — 마커는
-    이미 pop 에서 삭제됐다(1회성, 무한 알림 방지).
+    타겟: role_channel("봇상태") 고정 · 미매핑(자동생성 실패) 시 마커의 요청 채널(channel_id) 폴백.
+    wait_ready 는 Adapter 계약 밖 어댑터 훅이라 getattr 로 선택 호출(계약 표면 오염 방지). send 실패
+    해도 무해 — 마커는 이미 pop 에서 삭제됐다(1회성, 무한 알림 방지).
     """
     wait_ready = getattr(adapter, "wait_ready", None)
     if callable(wait_ready):
-        wait_ready(30)  # DC: Gateway on_ready 까지(≤30s). 타임아웃이어도 시도는 한다.
-    status_ch = adapter.role_channel("봇상태")  # DC #봇-상태(없으면 요청 chat 폴백)
+        wait_ready(30)  # Gateway on_ready 까지(≤30s). 타임아웃이어도 시도는 한다.
+    status_ch = adapter.role_channel("봇상태")  # #봇-상태(없으면 요청 채널 폴백)
     adapter.send(status_ch if status_ch is not None else channel_id, "✅ 재시작 완료")
 
 
 def _dispatch_loop(
     adapter: Adapter,
-    allowed: frozenset[int],
     schedules: list[dict[str, Any]],
     stop: threading.Event,
 ) -> None:
     """알림 스케줄 주기 틱(§3.3) — poll 카데언스와 독립된 타이머 스레드. stop 시 즉시 종료."""
     while not stop.wait(NOTIFY_TICK_SEC):
         try:
-            dispatch_notifications(adapter, allowed, schedules)
+            dispatch_notifications(adapter, schedules)
         except Exception as e:  # 알림 발송 오류로 스레드가 죽지 않게(타입만 기록)
             log.error("알림 발송 중 예외: %s", type(e).__name__)
 
@@ -1648,26 +1666,14 @@ def main() -> int:
         timeout = 900
     target_root_rel = env.get("TARGET_ROOT", "Hachiware/_Project").strip()
 
-    # 플랫폼 선택(0d): DISCORD_BOT_TOKEN 이 있으면 디스코드, 아니면 텔레그램(양쪽 공존).
-    # BRIDGE_PLATFORM=telegram 을 명시하면 디스코드 토큰이 있어도 텔레그램을 강제한다.
-    platform = env.get("BRIDGE_PLATFORM", "").strip().lower()
-    dc_token = env.get("DISCORD_BOT_TOKEN", "").strip()
-    use_discord = platform == "discord" or (platform != "telegram" and bool(dc_token))
-
-    if use_discord:
-        token = dc_token
-        allowed = parse_allowed(env.get("DISCORD_ALLOWED_USER_IDS", ""))
-        token_key, allowed_key = "DISCORD_BOT_TOKEN", "DISCORD_ALLOWED_USER_IDS"
-    else:
-        token = env.get("TG_BOT_TOKEN", "").strip()
-        allowed = parse_allowed(env.get("TG_ALLOWED_CHAT_IDS", ""))
-        token_key, allowed_key = "TG_BOT_TOKEN", "TG_ALLOWED_CHAT_IDS"
-
+    # 디스코드 전용(실행비서). 봇 토큰·허용 유저 ID 는 .env 로만(커밋 금지).
+    token = env.get("DISCORD_BOT_TOKEN", "").strip()
+    allowed = parse_allowed(env.get("DISCORD_ALLOWED_USER_IDS", ""))
     if not token:
-        log.error(".env 에 %s 이(가) 없습니다. .env.example 참고.", token_key)
+        log.error(".env 에 DISCORD_BOT_TOKEN 이(가) 없습니다. .env.example 참고.")
         return 1
     if not allowed:
-        log.error(".env 에 %s 가 없습니다(허용목록 필수). 종료.", allowed_key)
+        log.error(".env 에 DISCORD_ALLOWED_USER_IDS 가 없습니다(허용목록 필수). 종료.")
         return 1
     claude_exe = shutil.which("claude")
     if not claude_exe:
@@ -1688,20 +1694,16 @@ def main() -> int:
     notify_fired.update(_fired)
     notify_snooze.update(_snooze)
 
-    adapter: Adapter
-    if use_discord:
-        # 지연 import: discord.py 는 discord_adapter 에만 격리 — 텔레그램 경로는 이 줄에 닿지 않아
-        # discord.py 미설치 노트북에서도 죽지 않는다(본체 stdlib 전용 계약 유지).
-        from discord_adapter import DiscordAdapter
+    # 지연 import: discord.py 는 discord_adapter 에만 격리 — 코어(bridge)를 직접 import 하는
+    # 경로(selftest·단위 테스트)는 이 줄에 닿지 않아 discord.py 미설치 환경에서도 죽지 않는다
+    # (본체 stdlib 전용 계약 유지 = 플랫폼 교체 seam).
+    from discord_adapter import DiscordAdapter
 
-        adapter = DiscordAdapter(token, secrets, allowed, channel_map_file=CHANNEL_MAP_FILE)
-    else:
-        adapter = TelegramAdapter(token, secrets, OFFSET_FILE)
-    # ①(채널 자동생성 §4.4): 프로젝트 채널 목록 주입 — DC 는 on_ready 에서 생성, TG 는 no-op.
+    adapter: Adapter = DiscordAdapter(token, secrets, allowed, channel_map_file=CHANNEL_MAP_FILE)
+    # ①(채널 자동생성 §4.4): 프로젝트 채널 목록 주입 — on_ready 에서 생성.
     adapter.setup_channels(list_projects(target_root))
     log.info(
-        "브리지 시작(%s). target_root=%s allowed=%d개 알림=%d건",
-        "discord" if use_discord else "telegram",
+        "브리지 시작(discord). target_root=%s allowed=%d개 알림=%d건",
         target_root,
         len(allowed),
         len(schedules),
@@ -1719,11 +1721,11 @@ def main() -> int:
             daemon=True,
         ).start()
 
-    # ① 시각 알림: poll(롱폴링)이 블록하는 동안에도 발송되도록 독립 타이머 스레드로 구동(§3.3).
+    # ① 시각 알림: poll(Gateway 수신) 블록 중에도 발송되도록 독립 타이머 스레드로 구동(§3.3).
     stop = threading.Event()
     disp = threading.Thread(
         target=_dispatch_loop,
-        args=(adapter, allowed, schedules, stop),
+        args=(adapter, schedules, stop),
         name="dispatch",
         daemon=True,
     )
@@ -1759,6 +1761,8 @@ def _selftest() -> None:
     assert PUSH_WORDS <= COMMANDS  # 모든 별칭이 COMMANDS 에 포함
     assert frozenset(PLAIN_ALIASES) <= COMMANDS  # 평문 별칭도 COMMANDS 소속(프로젝트 오인 방지)
     assert "/restart" in COMMANDS and PLAIN_ALIASES["재시작"] == "/restart"  # 재시작 명령 등록
+    assert "/clean" in COMMANDS and PLAIN_ALIASES["청소"] == "/clean"  # 청소 명령 등록
+    assert COMMAND_ALIASES["/청소"] == "/clean"
     assert all(parse_message(w) is None for w in PUSH_WORDS)  # bare 별칭은 push 커맨드
     assert parse_message("프로젝트 알려줘") == ("프로젝트", "알려줘")  # 문장은 명령 아님(2단어)
     assert parse_message("기록해주고 푸시해줘") == ("기록해주고", "푸시해줘")  # 문장은 push 아님
@@ -1783,7 +1787,7 @@ def _selftest() -> None:
     _tool = {"type": "tool_use", "name": "Read", "input": {"file_path": "a/b/x.py"}}
     _ev = {"type": "assistant", "message": {"content": [_tool]}}
     assert event_to_progress(_ev) == "📖 읽음: x.py"
-    # Button 빌더(코어) — action/arg 정규화 검증(플랫폼 렌더는 telegram_adapter.render_buttons).
+    # Button 빌더(코어) — action/arg 정규화 검증(플랫폼 렌더는 discord_adapter.render_view).
     assert [b.action for b in push_buttons()] == ["push", "x"]
     _pb = project_buttons(["a", "b"])
     assert _pb[0].action == "p" and _pb[0].arg == "a"

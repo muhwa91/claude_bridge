@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """adapter.py — 플랫폼 무관 어댑터 계약(동결: docs/기능/디스코드_이관/02_계약.md §1·§2).
 
-코어는 이 2개 dataclass(`Event`·`Button`)와 `Adapter` 6메서드만 안다. 텔레그램 update /
-디스코드 이벤트는 어댑터가 `Event` 로 정규화하고, 코어의 `Button` 리스트를 플랫폼 UI 로 렌더한다.
-stdlib 전용 — 플랫폼 라이브러리(urllib·discord.py)는 각 어댑터 파일에만 격리된다.
+코어는 이 2개 dataclass(`Event`·`Button`)와 `Adapter` 계약 메서드만 안다. 플랫폼(현재 구현:
+디스코드) 이벤트는 어댑터가 `Event` 로 정규화하고, 코어의 `Button` 리스트를 플랫폼 UI 로 렌더한다.
+플랫폼 라이브러리(discord.py)는 어댑터 파일(discord_adapter.py)에만 격리되고, 이 모듈과 코어는
+표준 라이브러리만 쓴다. 콜백 코덱·청킹·다운로드 가드 등 플랫폼 무관 공유 유틸도 여기 둔다
+(어댑터가 바뀌어도 재사용 — 플랫폼 교체 seam).
 """
 
 from __future__ import annotations
 
+import urllib.request
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 
 @dataclass(frozen=True)
 class Button:
-    """추상 버튼 스펙. 어댑터가 플랫폼 UI 로 렌더(TG inline_keyboard ↔ DC discord.ui.Button)."""
+    """추상 버튼 스펙. 어댑터가 플랫폼 UI(현재 구현: discord.ui.Button)로 렌더한다."""
 
     label: str
     # 정규화 액션: push|x|p|c|nb:ok|nb:later + §4.7 델타3(r|rec|fav|fav:add|fav:del).
@@ -29,31 +32,32 @@ class Button:
 
 @dataclass(frozen=True)
 class Event:
-    """TG update / DC 이벤트를 정규화한 코어 입력."""
+    """플랫폼 이벤트를 정규화한 코어 입력."""
 
     kind: str  # "text"|"photo"|"button"|"command"
-    channel_id: int  # 격리·라우팅 키 (chat.id ↔ channel.id)
-    user_id: int  # 인가 키 (from.id ↔ author.id) — 허용목록 대조
+    channel_id: int  # 격리·라우팅 키 (channel.id)
+    user_id: int  # 인가 키 (author.id) — 허용목록 대조
     text: str = ""  # 본문 or 사진 캡션
     message_id: int | None = None  # 편집 대상
     action: str = ""  # 버튼 정규화 액션(kind=="button")
     action_arg: str = ""  # 버튼 인자
-    callback_id: str | None = None  # ack 핸들 (callback_query_id ↔ interaction 토큰)
-    photo_ref: str | None = None  # 파일 핸들 (file_id ↔ attachment.url)
-    project: str | None = None  # DC 는 채널→프로젝트(channel_map)를 어댑터가 미리 채움. TG 는 None
-    # §4.7 델타2: 답장 이어가기(④). TG=reply_to_message.message_id / DC=message.reference.msg_id.
+    callback_id: str | None = None  # ack 핸들 (interaction 토큰)
+    photo_ref: str | None = None  # 파일 핸들 (attachment.url)
+    project: str | None = None  # 어댑터가 채널→프로젝트(channel_map)를 미리 채움. 미매핑(DM)은 None
+    # §4.7 델타2: 답장 이어가기(④). message.reference.msg_id.
     # 1a 는 어댑터가 채우기만·코어 소비는 1c(frozen 기본값이라 기존 생성부는 무영향).
     reply_to: int | None = None
-    # ①(채널 자동생성): 특수 채널 역할 태그("간단처리"|"데이터분석"|"알림"|"봇상태"). DC 어댑터가
-    # channel_map 으로 채운다. 프로젝트 채널은 project 로, 특수 채널은 이 필드로 라우팅. TG 는 None.
+    # ①(채널 자동생성): 특수 채널 역할 태그("간단처리"|"데이터분석"|"알림"|"봇상태"). 어댑터가
+    # channel_map 으로 채운다. 프로젝트 채널은 project, 특수 채널은 이 필드로 라우팅. 미매핑은 None.
     channel_role: str | None = None
 
 
 class Adapter(Protocol):
     """플랫폼 어댑터 계약(동결). 코어는 이 인터페이스만 호출한다.
 
-    계약 6메서드(poll·send·edit·ack·fetch_file·close) + H-1 목적 메서드 notify 1개(알림 발송 타겟을
-    인가목록과 분리 — 아래 참조). notify 외 6메서드·2 dataclass 는 불변(과설계 금지, §5.1).
+    계약 메서드(poll·send·edit·ack·fetch_file·close·setup_channels·role_channel·project_channel·
+    clear_channel)와 2 dataclass 는 플랫폼 교체 seam 이라 불변(과설계 금지, §5.1). 현재 구현은
+    디스코드 1개지만, 계약을 이 인터페이스로 고정해 다른 플랫폼으로 교체 가능한 구조를 유지한다.
     `secrets`: 마스킹 대상(봇토큰·내부경로). 생성 시 주입·보관(§2.1) — 코어의 L-1 진행 마스킹이
     잘라내기 전에 참조하므로 계약면에 노출한다(공유 속성 1개).
     """
@@ -68,15 +72,6 @@ class Adapter(Protocol):
         """전송(마스킹·청킹·버튼렌더는 어댑터 흡수). 첫 청크 message_id | 실패 시 None."""
         ...
 
-    def notify(self, user_id: int, text: str, buttons: list[Button] | None = None) -> int | None:
-        """알림 발송(H-1) — 허용 user_id 개인에게. send 는 채널 전용이라 분리한다.
-
-        인가목록(user_id)을 채널로 오용하면 디스코드에서 get_channel(user_id) 실패로 예약 알림이
-        조용히 유실된다. notify 는 user_id → DM(디스코드)/1:1 chat(텔레그램)으로 해석해 발송한다.
-        반환·예외 정책은 send 와 동일(실패는 로그·None). 청킹·마스킹·버튼렌더도 send 와 동형.
-        """
-        ...
-
     def edit(
         self, channel_id: int, message_id: int, text: str, buttons: list[Button] | None = None
     ) -> None:
@@ -84,7 +79,7 @@ class Adapter(Protocol):
         ...
 
     def ack(self, callback_id: str | None, note: str | None = None) -> None:
-        """버튼 탭 응답(TG answerCallbackQuery / DC followup). callback_id=None 이면 no-op."""
+        """버튼 탭 응답(디스코드 followup). callback_id=None 이면 no-op."""
         ...
 
     def fetch_file(self, photo_ref: str, dest_dir: Path) -> Path:
@@ -92,11 +87,11 @@ class Adapter(Protocol):
         ...
 
     def close(self) -> None:
-        """연결 정리(DC Gateway 종료 / TG no-op). 중복 호출 무해."""
+        """연결 정리(디스코드 Gateway 종료). 중복 호출 무해."""
         ...
 
     def setup_channels(self, project_names: list[str]) -> None:
-        """①(채널 자동생성): 봇 기동 시 1회 카테고리·채널 구성(있으면 재사용). DC 전용, TG no-op.
+        """①(채널 자동생성): 봇 기동 시 1회 카테고리·채널 구성(있으면 재사용).
 
         project_names = 프로젝트 카테고리 채널 목록(코어 list_projects). 특수 채널(간단처리·데이터
         분석·알림·봇상태) 구조는 어댑터가 안다. channelID→역할/폴더 매핑을 영속(channel_map.json).
@@ -104,24 +99,32 @@ class Adapter(Protocol):
         ...
 
     def role_channel(self, role: str) -> int | None:
-        """특수 채널 역할("알림"|"봇상태"|…) → channelID. DM 폐기로 알림·재시작완료가 여기로 간다.
+        """특수 채널 역할("알림"|"봇상태"|…) → channelID(channel_map 역조회). 없으면 None.
 
-        DC = channel_map 역조회, TG = None(채널 없음 → 코어가 notify(1:1)로 폴백).
+        DM 폐기로 알림·재시작완료가 이 채널로 간다. 매핑이 없으면(자동생성 실패) None 을 반환하고
+        코어가 해당 발송을 스킵/폴백한다.
         """
         ...
 
     def project_channel(self, project: str) -> int | None:
-        """프로젝트 폴더명 → 그 프로젝트 채널 channelID. role_channel 과 대칭(kind="project").
+        """프로젝트 폴더명 → 그 프로젝트 채널 channelID(channel_map 역조회). 없으면 None.
 
-        예약 확인 실행이 #알림이 아닌 프로젝트 채널로 스트리밍되도록 라우팅에 쓴다.
-        DC = channel_map 역조회, TG = None(채널 없음 → 코어가 현 채널 폴백).
+        예약 확인 실행이 #알림 대신 프로젝트 채널로 스트리밍되게 라우팅에 쓴다(없으면 현 채널 폴백).
+        """
+        ...
+
+    def clear_channel(self, channel_id: int) -> int:
+        """채널의 메시지를 전부 삭제하고 삭제 건수 반환. 파괴적 — 코어가 확인 버튼 뒤에만 호출.
+
+        TextChannel.purge(14일 이내 일괄삭제 + 초과분 개별삭제로 전부 지움). 권한(Manage
+        Messages) 없음·오류는 예외를 삼켜 **삭제된 만큼만** 반환(부분 성공 허용)하고 로깅한다.
         """
         ...
 
 
 # ── 플랫폼 무관 공유 유틸 ──────────────────────────────────────────────────
-# 코어·모든 어댑터가 공유하므로 순환 import 를 피해 이 shared base 에 둔다(bridge 는
-# 재-import 해 자기 표면으로 노출 = "코어 잔류" API 유지, 물리 위치만 여기).
+# 코어·어댑터가 공유하므로 순환 import 를 피해 이 shared base 에 둔다(bridge 는 재-import 해
+# 자기 표면으로 노출 = "코어 잔류" API 유지, 물리 위치만 여기). 플랫폼 라이브러리 의존 없음(stdlib).
 def mask_secrets(text: str, secrets: list[str]) -> str:
     """토큰·내부 경로 등 비밀값을 '***'로 치환. 빈 문자열은 무시(텍스트 파괴 방지)."""
     for s in secrets:
@@ -134,8 +137,106 @@ def _valid_id(s: object) -> bool:
     """알림 id 안전 규칙(방출·수신 계약 대칭): 비어있지 않고 ≤54자, [A-Za-z0-9_-] 만.
 
     이 규칙은 callback_data(nb:ok:<id>·nb:later:<id>) 로 왕복하므로 인바운드(parse_callback)와
-    아웃바운드(load_schedules→notify_buttons) 양측이 같은 문을 써야 한다. 상한 54 = TG callback_data
-    64B 캡에서 최장 접두 `nb:later:`(9B)를 뺀 여유. 길면 render_buttons 절단으로 왕복이 깨져(탭해도
-    매칭 실패) 방출을 여기서 막는다(근본 차단, 실사용 id 는 전부 짧아 무영향).
+    아웃바운드(load_schedules→notify_buttons) 양측이 같은 문을 써야 한다. 상한 54 = callback_data
+    캡에서 최장 접두 `nb:later:`(9B)를 뺀 여유. 길면 render 절단으로 왕복이 깨져(탭해도 매칭 실패)
+    방출을 여기서 막는다(근본 차단, 실사용 id 는 전부 짧아 무영향).
     """
     return isinstance(s, str) and 0 < len(s) <= 54 and all(c.isalnum() or c in "-_" for c in s)
+
+
+def chunk_text(text: str, limit: int) -> list[str]:
+    """플랫폼 한도(호출측 명시: 어댑터별 상수)로 분할. 빈 문자열이면 [""]."""
+    if text == "":
+        return [""]
+    return [text[i : i + limit] for i in range(0, len(text), limit)]
+
+
+def _dig(s: str) -> bool:
+    """정수 arg 안전 검사(§4.7 재사용): isascii()+isdigit() — 전각·위첨자 유니코드 숫자 차단."""
+    return s.isascii() and s.isdigit()
+
+
+def parse_callback(data: str) -> tuple[str, str] | None:
+    """callback_data(신뢰 경계 밖) → (action, arg). 화이트리스트 밖은 None.
+
+    `push`/`x`/`clean:ok` → (그대로, ""), `p:<name>` → ("p", name),
+    `nb:ok:<id>`/`nb:later:<id>` → ("nb:ok"/"nb:later", id). 임의 실행 없이 정확 매칭만.
+    """
+    if data in ("push", "x", "clean:ok"):
+        return (data, "")
+    if data.startswith("p:") and len(data) > 2:
+        return ("p", data[2:])
+    for prefix in ("nb:ok:", "nb:later:"):
+        if data.startswith(prefix):
+            item_id = data[len(prefix) :]
+            # id 는 우리가 발행하지만 callback_data 는 신뢰 경계 밖 — 방출측과 같은 문(_valid_id).
+            if _valid_id(item_id):
+                return (prefix[:-1], item_id)
+            return None
+    if data.startswith("c:"):
+        # c:<msg_id>:<idx|other> — msg_id 정수, 선택은 정수 인덱스 또는 'other'.
+        # L-3: isascii() 병행으로 전각·위첨자 등 유니코드 숫자(int() 통과)를 차단.
+        parts = data.split(":")
+        mid_ok = len(parts) == 3 and parts[1].isascii() and parts[1].isdigit()
+        sel_ok = mid_ok and (parts[2] == "other" or (parts[2].isascii() and parts[2].isdigit()))
+        if sel_ok:
+            return ("c", f"{parts[1]}:{parts[2]}")
+        return None
+    # §4.7 델타3: 후속버튼(②)·매크로(③) 콜백. 전부 정수 arg(isascii+isdigit 재사용) — 라우팅은
+    # 1b·1e, 여기선 코덱만. 정확 매칭 밖은 None(폐기) 불변. 코어 _handle_button 은 미분기라
+    # "ack 후 무시"로 안전(1a 는 이 버튼들을 방출하지 않음 — 코덱만 준비).
+    if data.startswith("r:"):
+        # r:<mid> (재실행) | r:<mid>:go (확인 게이트 통과 실행). mid 정수, 접미는 정확히 'go'.
+        parts = data.split(":")
+        mid_ok = len(parts) in (2, 3) and _dig(parts[1])
+        if mid_ok and len(parts) == 2:
+            return ("r", parts[1])
+        if mid_ok and len(parts) == 3 and parts[2] == "go":
+            return ("r", f"{parts[1]}:go")
+        return None
+    if data.startswith("fav:"):
+        # fav:<idx> (실행) | fav:add:<idx> (등록) | fav:del:<idx> (삭제). idx 정수.
+        parts = data.split(":")
+        if len(parts) == 2 and _dig(parts[1]):
+            return ("fav", parts[1])
+        if len(parts) == 3 and parts[1] in ("add", "del") and _dig(parts[2]):
+            return (f"fav:{parts[1]}", parts[2])
+        return None
+    if data.startswith("rec:"):
+        # rec:<idx> — 최근 실행. idx 정수.
+        idx = data[len("rec:") :]
+        if _dig(idx):
+            return ("rec", idx)
+        return None
+    return None
+
+
+def encode_callback(action: str, arg: str) -> str:
+    """정규화 (action, arg) → callback_data 문자열(parse_callback 의 역함수).
+
+    코어 Button.action/arg 를 어댑터 전송 문자열로 직렬화. 디코드(parse_callback)의 역.
+    """
+    if action in ("push", "x", "clean:ok"):
+        return action
+    # 콜론-join 액션(§1.3 + §4.7 델타3): arg(id·mid·idx·"mid:idx"·"mid:go")를 그대로 이어붙인다.
+    if action in ("p", "nb:ok", "nb:later", "c", "r", "rec", "fav", "fav:add", "fav:del"):
+        return f"{action}:{arg}"
+    return action  # 방출측이 유효 액션만 넘기므로 폴백은 그대로
+
+
+# ── 사진 다운로드 공유 상수·리다이렉트 차단 opener(어댑터 fetch_file 이 재사용) ──
+MAX_PHOTO_BYTES = 10 * 1024 * 1024  # 10MB 상한
+PHOTO_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+
+
+# M-3: 리다이렉트 차단 opener. 화이트리스트 CDN 이 3xx 로 내부주소(오라클 메타데이터
+# 169.254.169.254 등)를 가리켜도 추종하지 않는다 — redirect_request→None 이면 urllib 이 그 3xx 를
+# HTTPError 로 승격해(추종 안 함) 내부주소 재요청을 원천 차단한다. 사진 다운로드(fetch_file)만 이
+# opener 를 쓴다 — 고정호스트 REST 는 무관.
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        # 3xx 를 추종하지 않음 → urllib 이 HTTPError 로 승격(내부주소 재요청 원천 차단).
+        return None
+
+
+_NOREDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)

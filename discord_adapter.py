@@ -6,13 +6,14 @@ spike/discord_bridge_spike.py 로 실증한 패턴을 정식화한다: discord.p
 적재하면 poll() 이 `.get()` 으로 직렬 소비한다(§2.4/§3.2). send/edit/ack 는 워커(동기) 스레드에서
 `run_coroutine_threadsafe(coro, loop).result(timeout)` 로 코루틴 완료까지 블록해 동기 값을 반환한다.
 
-의존성 격리: discord.py import 는 **이 파일에만** 있다. 텔레그램 실행 경로(bridge.main)는 이
-모듈을 지연 import 하므로 discord.py 미설치 노트북에서도 죽지 않는다(계약: 본체 stdlib 전용).
+의존성 격리: discord.py import 는 **이 파일에만** 있다. 코어(bridge.main)는 이 모듈을 지연
+import 하므로 discord.py 미설치 환경에서도 순수 함수 경로(selftest·단위 테스트)가 죽지 않는다
+(계약: 본체 stdlib 전용).
 
-보안 경계(§2.4 계승·비완화):
+보안 경계(§2.4):
 - fetch_file 은 디스코드 CDN 도메인 화이트리스트(cdn.discordapp.com/media.discordapp.net)·확장자·
-  10MB·경로 트래버설 차단(basename 만)을 텔레그램 download_file 과 동형으로 적용.
-- custom_id 는 신뢰 경계 밖 — parse_callback 정확 매칭만(임의 실행 금지, 텔레그램과 같은 코덱).
+  10MB·경로 트래버설 차단(basename 만)을 적용.
+- custom_id 는 신뢰 경계 밖 — parse_callback 정확 매칭만(임의 실행 금지).
 - 봇 토큰은 어댑터 인스턴스에만 보관, 전송 직전 mask_secrets 로 방어심층 마스킹.
 """
 
@@ -31,31 +32,33 @@ from collections.abc import Callable, Coroutine, Iterator
 from pathlib import Path
 from typing import Any
 
-import discord  # 유일한 discord.py import 지점 — 텔레그램 경로는 이 모듈을 import 하지 않는다.
-from adapter import Button, Event, mask_secrets
+import discord  # 유일한 discord.py import 지점.
+
+# 콜백 코덱(parse_callback/encode_callback)·청킹·다운로드 가드는 플랫폼 무관 정본(§1.3·§2.4)이라
+# 공유 base(adapter)에서 재사용한다 — adapter 는 stdlib 전용이라 여기서 import 해도 추가 런타임
+# 의존이 생기지 않는다(순수 문자열/상수 재사용, 보안 로직 단일 소스 유지).
+from adapter import (
+    _NOREDIRECT_OPENER,
+    MAX_PHOTO_BYTES,
+    PHOTO_EXTS,
+    Button,
+    Event,
+    chunk_text,
+    encode_callback,
+    mask_secrets,
+    parse_callback,
+)
 
 # 코어 회신 헤더 상수(§4.1 색 판정 단일 소스) + 프로젝트 한글 라벨(채널명 표시용). 어댑터→코어
 # 방향 import 지만 discord.py 를 코어로 끌어들이지 않는다(bridge 는 stdlib 전용·discord_adapter 를
 # top-level import 안 함 — 순환 없음). PROJECT_LABELS 는 채널 표시명, channel_map 값은 폴더명 원문.
 from bridge import HEADER_DONE, HEADER_FAIL, HEADER_NOTE, PROJECT_LABELS, STATUS_LEADERS
 
-# 콜백 코덱(parse_callback/encode_callback)·청킹·다운로드 상수는 플랫폼 무관 정본(§1.3·§2.4)이라
-# telegram_adapter 에서 재사용한다 — telegram_adapter 는 stdlib 전용이므로 여기서 import 해도
-# 텔레그램 런타임 의존이 생기지 않는다(순수 문자열/상수 재사용, 보안 로직 단일 소스 유지).
-from telegram_adapter import (
-    _NOREDIRECT_OPENER,
-    MAX_PHOTO_BYTES,
-    PHOTO_EXTS,
-    chunk_text,
-    encode_callback,
-    parse_callback,
-)
-
 log = logging.getLogger("bridge")
 
 DISCORD_LIMIT = 2000  # 디스코드 메시지 한도(§2.1) — 초과 장문은 청킹.
 _CUSTOM_ID_LIMIT = 100  # 디스코드 custom_id 한도(§1.3). 우리 콜백 문자열은 항상 이 안(id·name≤64).
-_CALL_TIMEOUT = 30  # run_coroutine_threadsafe().result() 타임아웃(§3.2 — tg_call 30s 와 정합).
+_CALL_TIMEOUT = 30  # run_coroutine_threadsafe().result() 타임아웃(§3.2).
 # fetch_file 다운로드 도메인 고정(§2.4 — 임의 URL 다운로드=SSRF 차단).
 _DISCORD_CDN_HOSTS = frozenset({"cdn.discordapp.com", "media.discordapp.net"})
 
@@ -66,7 +69,7 @@ _DISCORD_CDN_HOSTS = frozenset({"cdn.discordapp.com", "media.discordapp.net"})
 _COLOR_DONE = 0x3ECF85  # 초록 — 처리완료
 _COLOR_FAIL = 0xF0565B  # 빨강 — 처리실패
 _COLOR_INFO = 0x5865F2  # 블러플 — 추가 확인사항 / push 승인 대기
-_COLOR_WAIT = 0xEEBB4D  # 노랑 — 진행 중 / 예약 알림(DM)
+_COLOR_WAIT = 0xEEBB4D  # 노랑 — 진행 중 / 예약 알림
 _EMBED_TITLE_LIMIT = 256  # discord Embed title 한도
 _EMBED_DESC_LIMIT = 4096  # discord Embed description 한도(§4.1 — 초과분은 후속 plain 청크)
 
@@ -79,14 +82,17 @@ _EMBED_DESC_LIMIT = 4096  # discord Embed description 한도(§4.1 — 초과분
 _CAT_SIMPLE = "🗂️ 간단처리"
 _CAT_PROJECT = "📁 프로젝트"
 _CAT_DATA = "📊 데이터분석"
+_CAT_SCHED = "🗓️ 스케쥴러"
 _CAT_SYSTEM = "⚙️ 시스템"
 _CAT_VOICE = "🎵 PlayList"
-_CAT_ORDER = [_CAT_SIMPLE, _CAT_PROJECT, _CAT_DATA, _CAT_SYSTEM, _CAT_VOICE]  # 위치 순서(0..4)
+# 위치 순서(0..5): 데이터분석 아래·시스템 위에 스케쥴러 삽입.
+_CAT_ORDER = [_CAT_SIMPLE, _CAT_PROJECT, _CAT_DATA, _CAT_SCHED, _CAT_SYSTEM, _CAT_VOICE]
 # 카테고리별 코어 별칭(기존 탐색) — 대부분 코어명 1개, 음성은 이전 이름 '음성' 포함.
 _CAT_ALIASES: dict[str, list[str]] = {
     _CAT_SIMPLE: ["간단처리"],
     _CAT_PROJECT: ["프로젝트"],
     _CAT_DATA: ["데이터분석"],
+    _CAT_SCHED: ["스케쥴러"],
     _CAT_SYSTEM: ["시스템"],
     _CAT_VOICE: ["PlayList", "음성"],
 }
@@ -100,6 +106,7 @@ _DATA_TOPIC = "HTML 리포트는 디스코드에 안 뜸 — 파일/요약만." 
 _SPECIAL: dict[str, list[tuple[str, str, str]]] = {
     _CAT_SIMPLE: [("간단처리", "role", "간단처리")],
     _CAT_DATA: [("데이터분석", "role", "데이터분석")],  # 하이픈 원천 제거
+    _CAT_SCHED: [("미국주식", "role", "미국주식"), ("오픈소스", "role", "오픈소스")],
     _CAT_SYSTEM: [("알림", "role", "알림"), ("봇상태", "role", "봇상태")],  # 하이픈 원천 제거
 }
 # 프로젝트 채널 내부 정본 순서(폴더명). 목록에 없는 프로젝트는 뒤로. h_* 를 맨 위(개발자 확정).
@@ -226,7 +233,7 @@ def render_view(buttons: list[Button]) -> Any:
     view = discord.ui.View(timeout=None)
     for b in buttons:
         # custom_id 는 char 기준 100자 캡(우리 값은 항상 그 안). 초과 시 잘리면 parse_callback 이
-        # 거르므로(오작동 대신 무시) 안전. 텔레그램은 64바이트 캡 — 한도만 다르고 코덱은 동일.
+        # 거르므로(오작동 대신 무시) 안전(char 기준 100자 캡).
         cid = encode_callback(b.action, b.arg)[:_CUSTOM_ID_LIMIT]
         view.add_item(discord.ui.Button(label=b.label, style=_style(b.style), custom_id=cid))
     return view
@@ -304,7 +311,7 @@ class DiscordAdapter:
         self._register_events()
 
     def wait_ready(self, timeout: float = 30) -> bool:
-        """Gateway on_ready 까지 대기(접속 후 send 안전 타이밍). TG 에는 없는 DC 전용 얇은 훅."""
+        """Gateway on_ready 까지 대기(접속 후 send 안전 타이밍). Adapter 계약 밖 디스코드 훅."""
         return self._ready.wait(timeout)
 
     def setup_channels(self, project_names: list[str]) -> None:
@@ -324,6 +331,14 @@ class DiscordAdapter:
             if kind == "project" and tag == project:
                 return cid
         return None
+
+    def clear_channel(self, channel_id: int) -> int:
+        """채널 메시지 전체 삭제(purge) 후 삭제 건수. 파괴적 — 코어가 확인 버튼 뒤에만 호출.
+
+        _run 이 루프 미준비·예외를 삼켜 None 을 줄 수 있으므로 int 아니면 0(안전 폴백).
+        """
+        result = self._run(self._purge_coro(channel_id))
+        return result if isinstance(result, int) else 0
 
     async def _ensure_channels(self) -> None:
         """F1: on_ready 재진입 직렬화(재접속 중복생성 경쟁 차단) 후 실제 셋업. 셋업 경로 전용."""
@@ -358,6 +373,7 @@ class DiscordAdapter:
             (_CAT_SIMPLE, _SPECIAL[_CAT_SIMPLE]),
             (_CAT_PROJECT, proj_chans),
             (_CAT_DATA, _SPECIAL[_CAT_DATA]),
+            (_CAT_SCHED, _SPECIAL[_CAT_SCHED]),
             (_CAT_SYSTEM, _SPECIAL[_CAT_SYSTEM]),
         ]
         old_by_keytag = {(k, t): cid for cid, (k, t) in self._channel_map.items()}
@@ -684,7 +700,7 @@ class DiscordAdapter:
     ) -> int | None:
         """마스킹·상태판정·청킹·버튼(마지막 파트만) 공통 발송 루프. coro(part, view)→id. 첫 id 반환.
 
-        send(채널)·notify(user DM)가 대상 해석 코루틴만 달리해 공유한다(§2.1 규칙 단일 소스).
+        send 가 대상 해석 코루틴을 주입해 발송 규칙(§2.1)을 단일 소스로 공유한다.
         """
         parts = self._render_parts(text)
         last = len(parts) - 1
@@ -707,14 +723,6 @@ class DiscordAdapter:
             mid = self._run(self._send_view_coro(channel_id, view))
             return mid if isinstance(mid, int) else None
         return self._emit(text, buttons, lambda body, view: self._send_coro(channel_id, body, view))
-
-    def notify(self, user_id: int, text: str, buttons: list[Button] | None = None) -> int | None:
-        """H-1: 허용 user_id 의 DM 으로 발송(알림 브로드캐스트 타겟). send 는 채널 전용이라 분리.
-
-        user_id → get_user/fetch_user → create_dm 채널로 해석해 발송(§2.1 청킹·마스킹·버튼 동형).
-        run_coroutine_threadsafe 경계·예외 삼킴은 _run 이 흡수(실패는 로그·None).
-        """
-        return self._emit(text, buttons, lambda body, view: self._dm_send_coro(user_id, body, view))
 
     def edit(
         self,
@@ -819,13 +827,6 @@ class DiscordAdapter:
         msg = await channel.send(view=view)
         return int(msg.id)
 
-    async def _dm_send_coro(self, user_id: int, payload: Any, view: Any) -> int | None:
-        """H-1: user_id → DM 채널 해석 후 발송. get_user 캐시 우선, 없으면 fetch_user."""
-        user = self._client.get_user(user_id) or await self._client.fetch_user(user_id)
-        channel = user.dm_channel or await user.create_dm()
-        msg = await channel.send(**_send_kwargs(payload, view))
-        return int(msg.id)
-
     async def _edit_coro(self, channel_id: int, message_id: int, payload: Any, view: Any) -> None:
         channel = self._client.get_channel(channel_id) or await self._client.fetch_channel(
             channel_id
@@ -840,3 +841,24 @@ class DiscordAdapter:
 
     async def _followup_coro(self, interaction: Any, note: str) -> None:
         await interaction.followup.send(note)
+
+    async def _purge_coro(self, channel_id: int) -> int:
+        """채널 메시지를 100개씩 반복 purge 해 전부 삭제, 삭제 건수 합 반환(§clear_channel).
+
+        bulk=True 는 14일 이내는 일괄삭제, 14일 초과분은 개별삭제로 폴백한다(discord.py 규약).
+        100개 미만이 돌아오면 히스토리 소진으로 보고 종료. Manage Messages 권한 없음·API 오류는
+        DiscordException 을 삼켜 그때까지 삭제한 건수만 반환(부분 성공 허용) 후 로깅한다.
+        """
+        channel = self._client.get_channel(channel_id) or await self._client.fetch_channel(
+            channel_id
+        )
+        total = 0
+        try:
+            while True:
+                deleted = await channel.purge(limit=100, bulk=True)
+                total += len(deleted)
+                if len(deleted) < 100:  # 이번 배치가 100 미만 = 더 지울 게 없음
+                    break
+        except discord.DiscordException as e:
+            log.warning("채널 청소 부분 실패(%s) — %d개 삭제 후 중단", type(e).__name__, total)
+        return total
