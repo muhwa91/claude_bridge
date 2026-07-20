@@ -46,6 +46,10 @@ NOTIFY_STATE_FILE = LOG_DIR / "notify_state.json"
 RESTART_NOTICE_FILE = LOG_DIR / "restart_notice.json"  # '재시작' 요청 chat — 재기동 후 복귀 통지용
 CHANNEL_MAP_FILE = LOG_DIR / "channel_map.json"  # channelID→(kind,tag) 매핑(자동생성 §4.4)
 PHOTO_DIR = LOG_DIR / "photos"
+# 오라클 VM 자동 재시도 런처가 매 루프 기록하는 상태 파일(절대경로 고정, 현 호스트 전용).
+# ponytail: 이 경로는 현 호스트(데스크탑) 런처 전용 — VM 이전 후엔 무의미(그땐 오라클 이미 확보).
+# 읽기는 방어적(없음·손상 → 폴백 안내). VM 확보 후 이 상수·`오라클` 명령은 삭제 가능.
+ORACLE_STATUS_FILE = Path.home() / ".oci" / "claude_bridge_launcher" / "status.json"
 
 # ① 시각 알림용 상수. now·요일 판정은 항상 KST 기준(스케줄 at 은 KST HH:MM).
 # KST 는 서머타임이 없어 고정 오프셋 +09:00 이면 충분 — ZoneInfo(IANA tz DB) 를 피해
@@ -73,6 +77,24 @@ STATUS_LEADERS = (LEAD_RUN, LEAD_PHOTO, LEAD_CHECK, LEAD_NOTIFY)
 # push 별칭(정확 일치만 push 로 취급 — 부분매칭 금지). 영어/한글 변형을 한 집합으로.
 # COMMANDS 에 포함시켜 parse_message 가 이들을 프로젝트명으로 오해하지 않게 한다.
 PUSH_WORDS = frozenset({"push", "푸시", "푸시해", "푸시해줘", "푸쉬", "푸쉬해", "푸쉬해줘"})
+# '오라클…' 상태 조회어 — PUSH_WORDS 처럼 공백접기 단독 정확매칭. 문장("오라클 연결 안되면…")은
+# 미발동 → 일반 실행(startswith 오탐 방지). 짧은 조회 표현만.
+ORACLE_WORDS = frozenset(
+    {
+        "오라클",
+        "오라클?",
+        "오라클상태",
+        "오라클상태?",
+        "오라클상태어때",
+        "오라클상태어때?",
+        "오라클어때",
+        "오라클어때?",
+        "오라클현황",
+        "오라클현황?",
+        "오라클됐어",
+        "오라클됐어?",
+    }
+)
 # 한글 명령 별칭(§4.8 모바일 우선) → 영어 정규. /즐겨찾기·/최근 은 1e(죽은 명령 금지 — 미추가).
 COMMAND_ALIASES = {
     "/도움말": "/help",
@@ -127,11 +149,15 @@ BRIDGE_SYSTEM_PROMPT = (
     "고른 값이 다음 입력으로 전달되니 그때 이어서 진행하라."
 )
 
-# claude CLI 허용 도구 화이트리스트(= 안전 경계). 일반 Bash·git push·네트워크 미포함.
+# claude CLI 허용 도구 화이트리스트(= 안전 경계). 일반 Bash(curl 등)·git push 미포함.
+# WebSearch/WebFetch(읽기전용 웹조회)는 허용 — #간단처리 등에서 시세·정보 질문에 답하기 위함.
+# (임의 셸·네트워크 쓰기는 여전히 차단 — 원격실행 표면 최소화 유지.)
 ALLOWED_TOOLS = [
     "Read",
     "Edit",
     "Write",
+    "WebSearch",
+    "WebFetch",
     "Bash(git add *)",
     "Bash(git commit *)",
     "Bash(git status *)",
@@ -861,6 +887,37 @@ def format_reply(data: dict[str, Any]) -> str:
     return f"{header}\n\n{result}" if result else header
 
 
+_ORACLE_NONE = "오라클 자동 재시도 정보가 없습니다(런처 미가동)."
+
+
+def format_oracle_status(path: Path) -> str:
+    """오라클 재시도 런처 status.json → 상태 회신 1줄. 파일 없음·손상·형식불일치는 폴백. 순수.
+
+    스키마: {running, attempts, elapsed_min, started_kst, updated_kst, last_code, success,
+    public_ip, error}. 우선순위 success > error > running > 폴백(로더 방어 스타일).
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return _ORACLE_NONE
+    if not isinstance(raw, dict):
+        return _ORACLE_NONE
+    if raw.get("success"):
+        ip, tries = raw.get("public_ip"), raw.get("attempts")
+        return f"🎉 오라클 VM 잡힘! 퍼블릭 IP: {ip} (총 {tries}회 시도)"
+    if raw.get("error"):
+        return f"⛔ 오라클 자동 재시도 중단: {raw.get('error')}"
+    if raw.get("running"):
+        elapsed = raw.get("elapsed_min", 0)
+        if not isinstance(elapsed, int):
+            elapsed = 0
+        return (
+            f"⏰ 오라클 자동 재시도 — 약 {raw.get('attempts')}회 시도 · "
+            f"{elapsed // 60}시간 {elapsed % 60}분째 · 마지막 응답: {raw.get('last_code')}"
+        )
+    return _ORACLE_NONE
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # git push (승인 시에만)
 # ══════════════════════════════════════════════════════════════════════════
@@ -1279,14 +1336,10 @@ def _handle_button(
         else:
             adapter.send(channel_id, "취소했습니다.")
     elif action == "clean:ok":
-        # 청소 확인 탭 → 채널 메시지 전체 삭제. purge 가 이 확인 메시지까지 지우므로 message_id
-        # 를 edit 하지 말고(사라진 메시지 편집=실패), 삭제 후 새 메시지를 send 한다.
+        # 청소 확인 탭 → 채널 메시지 전체 삭제(무음: 완료 메시지 없음, 개발자 요청). purge 가
+        # 확인 메시지까지 지워 채널이 깨끗해지고 끝 — send/edit 안 함(edit 은 사라진 메시지라 실패).
         log.info("chat=%s callback clean:ok", channel_id)
-        n = adapter.clear_channel(channel_id)
-        if n > 0:
-            adapter.send(channel_id, f"🧹 {n}개 삭제 완료.")
-        else:
-            adapter.send(channel_id, "삭제할 메시지가 없거나 지원하지 않습니다.")
+        adapter.clear_channel(channel_id)
     elif action == "nb:ok":
         # 확인시작 = 예약 점검을 실제 실행. 알림 항목(id=arg)을 재로드해 project·note 로
         # 헤드리스 claude 점검을 돌린다(자동수정 금지 — build_notify_check_prompt).
@@ -1507,10 +1560,51 @@ def _handle_text(
         log.info("chat=%s push 결과=%s", channel_id, outcome)
         return
 
+    # '오라클…' 은 claude 작업이 아니라 재시도 런처 status.json 상태 조회(평문 명령과 일관).
+    # 공백접기 단독 정확매칭 — "오라클 연결 안되면…" 같은 문장은 미발동(일반 실행으로 넘어감).
+    if "".join(stripped.split()).casefold() in ORACLE_WORDS:
+        log.info("chat=%s cmd=oracle", channel_id)
+        adapter.send(channel_id, format_oracle_status(ORACLE_STATUS_FILE))
+        return
+
     # 특수 채널(#간단처리·#데이터-분석): 프로젝트 무관 일반 실행 — cwd=target_root·full tools(§4.4).
     # 프로젝트 접두·선택 고정 없이 메시지 전체를 지시로 실행. 인가·stdin·화이트리스트 불변.
     # 데이터분석 한계 안내는 채널 토픽에 1회(어댑터) — 매 메시지 반복 금지.
     if event.channel_role in _GENERAL_ROLES:
+        # 프로젝트명(폴더명 또는 한글 라벨)으로 시작하면 그 프로젝트 채널로 이동해 실행한다
+        # (로그·진행·결과가 프로젝트 채널로 스트리밍). 원채널엔 이동 흔적 한 줄만 남긴다.
+        # 프로젝트명이 아니거나 채널 매핑이 없으면(폴백) 아래 프로젝트-무관 일반 실행으로 회귀.
+        first = stripped.split(maxsplit=1)[0] if stripped else ""
+        folder = (
+            first
+            if resolve_project(first, target_root) is not None
+            # 한글 라벨 역맵(label→folder) — 정확 일치만(부분·casefold 매칭 없음).
+            else next((f for f, lbl in PROJECT_LABELS.items() if lbl == first), None)
+        )
+        proj_path = resolve_project(folder, target_root) if folder else None
+        proj_ch = adapter.project_channel(folder) if folder else None
+        if folder and proj_path is not None and proj_ch is not None and proj_ch != channel_id:
+            label = project_label(folder)
+            parts = stripped.split(maxsplit=1)
+            task = parts[1].strip() if len(parts) > 1 else ""
+            log.info("chat=%s 간단처리→프로젝트 이동 project=%s", channel_id, folder)
+            adapter.send(channel_id, f"🔀 「{label}」 작업을 <#{proj_ch}> 에서 진행합니다.")
+            chat_selection[proj_ch] = folder  # 이후 그 채널에서 프로젝트 생략 지시가 이어짐
+            if not task:
+                # 프로젝트명만 보냄(지시 없음) — 이동 후 선택만 고정하고 안내(버튼 탭과 동일 UX).
+                adapter.send(proj_ch, project_guide(folder))
+                return
+            run_claude_with_progress(
+                adapter,
+                proj_ch,
+                f"{LEAD_RUN} [{folder}] 작업 중…",
+                claude_exe,
+                proj_path,
+                task,
+                timeout,
+                user_id=event.user_id,
+            )
+            return
         log.info("chat=%s 일반 실행 role=%s", channel_id, event.channel_role)
         run_claude_with_progress(
             adapter,
@@ -1595,9 +1689,24 @@ def handle_event(
             timeout=timeout,
         )
     elif event.kind == "photo":
-        _handle_photo(
-            adapter, event, claude_exe=claude_exe, target_root=target_root, timeout=timeout
-        )
+        # 사진 대조는 trading_info(주식모니터링) 채널 전용 — REST(:8000)가 그 프로젝트만 존재.
+        # 그 외 채널(간단처리=project None·다른 프로젝트 채널)에 온 사진은 대조 대상이 아니므로,
+        # 캡션이 있으면 사진은 무시하고 캡션을 일반 지시로(_handle_text), 없으면 안내 1줄만.
+        if event.project == "trading_info":
+            _handle_photo(
+                adapter, event, claude_exe=claude_exe, target_root=target_root, timeout=timeout
+            )
+        elif event.text.strip():
+            _handle_text(
+                adapter,
+                event,
+                claude_exe=claude_exe,
+                repo_root=repo_root,
+                target_root=target_root,
+                timeout=timeout,
+            )
+        else:
+            adapter.send(event.channel_id, "사진 대조는 주식모니터링 채널에서만 돼요.")
     elif event.kind == "text":
         _handle_text(
             adapter,
@@ -1817,6 +1926,8 @@ def _selftest() -> None:
     assert valid_ticker("MU") and not valid_ticker("../etc")
     assert parse_caption_ticker("trading_info MU 대조") == "MU"
     assert stock_url("MU") == "http://127.0.0.1:8000/api/stocks/MU"
+    # 오라클 상태: 파일 없음 폴백.
+    assert format_oracle_status(PROJECT_DIR / "_nope_oracle.json") == _ORACLE_NONE
     print("selftest ok")
 
 

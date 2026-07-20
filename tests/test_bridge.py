@@ -32,6 +32,7 @@ from bridge import (
     due_snoozes,
     event_to_progress,
     fetch_stock,
+    format_oracle_status,
     format_reply,
     handle_event,
     is_allowed,
@@ -142,13 +143,24 @@ def _txt(user_id, text, *, message_id=None, channel_id=None):
     )
 
 
-def _photo(user_id, caption="MU", *, photo_ref="f", channel_id=None):
+def _photo(
+    user_id,
+    caption="MU",
+    *,
+    photo_ref="f",
+    channel_id=None,
+    project="trading_info",
+    channel_role=None,
+):
+    # project 기본 trading_info → handle_event 가 사진 대조(_handle_photo) 경로로 라우팅.
     return Event(
         kind="photo",
         channel_id=channel_id if channel_id is not None else user_id,
         user_id=user_id,
         text=caption if caption is not None else "",
         photo_ref=photo_ref,
+        project=project,
+        channel_role=channel_role,
     )
 
 
@@ -1207,21 +1219,22 @@ def test_clean_in_sentence_not_command(tmp_path):
     assert any("찾지 못" in t for _c, t, _b in a.sent)
 
 
-def test_clean_ok_callback_clears_channel(cb_env, tmp_path):
+def test_clean_ok_callback_clears_channel_silently(cb_env, tmp_path):
+    # 무음 정리(개발자 요청): purge 후 완료 메시지·edit 없이 그냥 깨끗해지고 끝.
     cb_env._clear_count = 5
     _fire(cb_env, _btn(777, "clean:ok"), repo_root=tmp_path, target_root=str(tmp_path))
     assert cb_env.cleared == [777]  # 그 채널을 청소
-    # purge 가 확인 메시지까지 지우므로 edit 하지 않고 새 메시지 send.
-    assert cb_env.edited == []
-    assert any("5개 삭제 완료" in t for _c, t, _b in cb_env.sent)
+    assert cb_env.edited == []  # 사라진 확인 메시지를 edit 안 함
+    assert cb_env.sent == []  # 완료 메시지 없음(무음)
     assert cb_env.acked == [("cq1", None)]  # 스피너 종료(ack 선행)
 
 
-def test_clean_ok_empty_channel_reports_unsupported(cb_env, tmp_path):
-    cb_env._clear_count = 0  # 삭제 0건(빈 채널·TG 스텁)
+def test_clean_ok_empty_channel_silent(cb_env, tmp_path):
+    # 삭제 0건(빈 채널·스텁)이어도 무음 — n==0 안내도 제거.
+    cb_env._clear_count = 0
     _fire(cb_env, _btn(777, "clean:ok"), repo_root=tmp_path, target_root=str(tmp_path))
     assert cb_env.cleared == [777]
-    assert any("없거나" in t for _c, t, _b in cb_env.sent)
+    assert cb_env.sent == []
 
 
 def test_clean_ok_disallowed_user_blocked():
@@ -1735,6 +1748,103 @@ def test_general_channel_commands_still_work(monkeypatch, tmp_path):
     assert a.sent[0][1] == bridge.HELP_TEXT
 
 
+def _spy_rcwp_ch(monkeypatch):
+    # (channel_id, proj, task) 기록 — 이동 실행이 프로젝트 채널로 가는지 검증용.
+    runs = []
+    monkeypatch.setattr(
+        bridge,
+        "run_claude_with_progress",
+        lambda *args, **_kw: runs.append((args[1], args[4], args[5])),
+    )
+    return runs
+
+
+def test_general_channel_project_prefix_moves_to_project_channel(monkeypatch, tmp_path):
+    # #간단처리 "trading_info <지시>" → 원채널 이동흔적 + 프로젝트 채널로 실행 + 선택 고정.
+    bridge.chat_selection.clear()
+    (tmp_path / "trading_info").mkdir()
+    runs = _spy_rcwp_ch(monkeypatch)
+    a = FakeAdapter(projects={"trading_info": 555})
+    ev = Event(
+        kind="text",
+        channel_id=100,
+        user_id=777,
+        text="trading_info 로그 봐줘",
+        channel_role="간단처리",
+    )
+    _fire(a, ev, target_root=str(tmp_path))
+    assert runs == [(555, str(tmp_path / "trading_info"), "로그 봐줘")]
+    assert a.sent[0][0] == 100 and "<#555>" in a.sent[0][1]  # 원채널 이동흔적(채널 링크)
+    assert bridge.chat_selection[555] == "trading_info"
+
+
+def test_general_channel_label_prefix_moves(monkeypatch, tmp_path):
+    # #간단처리 "주식모니터링 <지시>"(한글 라벨) → trading_info 로 매핑, 프로젝트 채널로 실행.
+    bridge.chat_selection.clear()
+    monkeypatch.setattr(bridge, "PROJECT_LABELS", {"trading_info": "주식모니터링"})
+    (tmp_path / "trading_info").mkdir()
+    runs = _spy_rcwp_ch(monkeypatch)
+    a = FakeAdapter(projects={"trading_info": 555})
+    ev = Event(
+        kind="text",
+        channel_id=100,
+        user_id=777,
+        text="주식모니터링 시세 확인",
+        channel_role="간단처리",
+    )
+    _fire(a, ev, target_root=str(tmp_path))
+    assert runs == [(555, str(tmp_path / "trading_info"), "시세 확인")]
+    assert bridge.chat_selection[555] == "trading_info"
+
+
+def test_general_channel_non_project_runs_project_less(monkeypatch, tmp_path):
+    # #간단처리 "그냥 일반 질문"(프로젝트 아님) → 기존 프로젝트-무관 실행(이동 안 함).
+    bridge.chat_selection.clear()
+    (tmp_path / "trading_info").mkdir()
+    runs = _spy_rcwp_ch(monkeypatch)
+    a = FakeAdapter(projects={"trading_info": 555})
+    ev = Event(
+        kind="text", channel_id=100, user_id=777, text="그냥 일반 질문", channel_role="간단처리"
+    )
+    _fire(a, ev, target_root=str(tmp_path))
+    assert runs == [(100, str(tmp_path), "그냥 일반 질문")]  # 원채널·cwd=root·전체 지시
+    assert not any("🔀" in t for _c, t, _b in a.sent)
+
+
+def test_general_channel_project_only_guides_and_fixes(monkeypatch, tmp_path):
+    # #간단처리 "trading_info"(지시 없음) → 프로젝트 채널로 이동 + 안내 + 선택 고정(실행 없음).
+    bridge.chat_selection.clear()
+    (tmp_path / "trading_info").mkdir()
+    runs = _spy_rcwp_ch(monkeypatch)
+    a = FakeAdapter(projects={"trading_info": 555})
+    ev = Event(
+        kind="text", channel_id=100, user_id=777, text="trading_info", channel_role="간단처리"
+    )
+    _fire(a, ev, target_root=str(tmp_path))
+    assert runs == []  # 실행 없음
+    assert a.sent[0][0] == 100 and "<#555>" in a.sent[0][1]  # 이동흔적
+    assert a.sent[1][0] == 555  # 프로젝트 채널로 안내
+    assert bridge.chat_selection[555] == "trading_info"
+
+
+def test_general_channel_project_prefix_no_channel_falls_back(monkeypatch, tmp_path):
+    # project_channel 미매핑 → 이동 안 하고 일반 실행 폴백(크래시 없음).
+    bridge.chat_selection.clear()
+    (tmp_path / "trading_info").mkdir()
+    runs = _spy_rcwp_ch(monkeypatch)
+    a = FakeAdapter()  # projects 비어있음 → project_channel None
+    ev = Event(
+        kind="text",
+        channel_id=100,
+        user_id=777,
+        text="trading_info 로그 봐줘",
+        channel_role="간단처리",
+    )
+    _fire(a, ev, target_root=str(tmp_path))
+    assert runs == [(100, str(tmp_path), "trading_info 로그 봐줘")]  # 일반 실행 폴백
+    assert not any("🔀" in t for _c, t, _b in a.sent)
+
+
 def test_restart_done_to_status_channel():
     # 재시작 완료 → #봇-상태 채널 고정(DM/원채널 아님).
     a = FakeAdapter(roles={"봇상태": 888})
@@ -2075,6 +2185,98 @@ def test_photo_allowed_user_triggers_handler(photo_env, tmp_path):
         target_root=str(tmp_path),
     )
     assert any("캡션" in t for _c, t, _b in photo_env.sent)
+
+
+def test_photo_non_trading_with_caption_routes_to_text(photo_env, tmp_path):
+    # #간단처리(project None·role 간단처리)에 사진+캡션 → 사진 무시, 캡션을 일반 지시로 실행.
+    # 주식 대조 문구("종목"·"캡션") 안 뜨고, 캡션이 run_claude_with_progress 로 실행돼야 한다.
+    _fire(
+        photo_env,
+        _photo(777, caption="이 값 좀 봐줘", project=None, channel_role="간단처리"),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert len(photo_env.runs) == 1  # 캡션이 일반 지시로 실행됨(_handle_text 경로)
+    assert photo_env.fetched == []  # 사진은 다운로드조차 안 함
+    assert not any("종목" in t or "캡션" in t for _c, t, _b in photo_env.sent)
+
+
+def test_photo_non_trading_without_caption_guides(photo_env, tmp_path):
+    # 비-trading 채널 사진 + 캡션 없음 → 실행 없이 안내 1줄.
+    _fire(
+        photo_env,
+        _photo(777, caption=None, project=None, channel_role="간단처리"),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert photo_env.runs == []
+    assert photo_env.fetched == []
+    assert any("주식모니터링 채널에서만" in t for _c, t, _b in photo_env.sent)
+
+
+# ---------------------------------------------------------------------------
+# #4b 오라클 상태 조회 — format_oracle_status(순수) + `오라클` 평문 명령(claude 미실행)
+# ---------------------------------------------------------------------------
+
+
+def _write_oracle(tmp_path, payload):
+    p = tmp_path / "status.json"
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    return p
+
+
+def test_oracle_status_success(tmp_path):
+    p = _write_oracle(tmp_path, {"success": True, "public_ip": "1.2.3.4", "attempts": 42})
+    out = format_oracle_status(p)
+    assert "🎉" in out and "1.2.3.4" in out and "42회" in out
+
+
+def test_oracle_status_error(tmp_path):
+    p = _write_oracle(tmp_path, {"success": False, "error": "예산 초과"})
+    out = format_oracle_status(p)
+    assert out == "⛔ 오라클 자동 재시도 중단: 예산 초과"
+
+
+def test_oracle_status_running(tmp_path):
+    p = _write_oracle(
+        tmp_path,
+        {"running": True, "attempts": 42, "elapsed_min": 63, "last_code": "재고 부족"},
+    )
+    out = format_oracle_status(p)
+    assert "⏰" in out and "42회" in out and "1시간 3분째" in out and "재고 부족" in out
+
+
+def test_oracle_status_missing_file(tmp_path):
+    out = format_oracle_status(tmp_path / "nope.json")
+    assert out == "오라클 자동 재시도 정보가 없습니다(런처 미가동)."
+
+
+def test_oracle_command_replies_without_running_claude(monkeypatch, tmp_path):
+    # `오라클` 로 시작하는 메시지는 claude 작업이 아니라 status.json 상태 회신(런처 조회).
+    payload = {"running": True, "attempts": 7, "elapsed_min": 5, "last_code": "x"}
+    p = _write_oracle(tmp_path, payload)
+    monkeypatch.setattr(bridge, "ORACLE_STATUS_FILE", p)
+    ran = []
+    monkeypatch.setattr(bridge, "run_claude_with_progress", lambda *_a, **_k: ran.append(1))
+    a = FakeAdapter()
+    _fire(a, _txt(777, "오라클 상태 어때"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert ran == []  # claude 미실행
+    assert any("⏰" in t for _c, t, _b in a.sent)
+
+
+def test_oracle_command_not_fired_on_sentence(monkeypatch, tmp_path):
+    # "오라클 …" 로 시작해도 문장이면 상태조회 미발동(startswith 오탐 회귀 방지).
+    payload = {"running": True, "attempts": 7, "elapsed_min": 5, "last_code": "x"}
+    p = _write_oracle(tmp_path, payload)
+    monkeypatch.setattr(bridge, "ORACLE_STATUS_FILE", p)
+    a = FakeAdapter()
+    _fire(
+        a,
+        _txt(777, "오라클 연결 안되면 어떡하지 이거 되어야 브릿지가 되는데"),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert not any("⏰" in t for _c, t, _b in a.sent)  # 상태조회 문구 미발동
 
 
 # ===========================================================================
