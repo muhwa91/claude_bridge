@@ -56,7 +56,8 @@ class Adapter(Protocol):
     """플랫폼 어댑터 계약(동결). 코어는 이 인터페이스만 호출한다.
 
     계약 메서드(poll·send·edit·ack·fetch_file·close·setup_channels·role_channel·project_channel·
-    clear_channel)와 2 dataclass 는 플랫폼 교체 seam 이라 불변(과설계 금지, §5.1). 현재 구현은
+    clear_channel·play_music·stop_music·skip_music)와 2 dataclass 는 플랫폼 교체 seam 이라 불변
+    (과설계 금지, §5.1). play/stop/skip_music 은 음성재생 capability(디스코드 전용). 현재 구현은
     디스코드 1개지만, 계약을 이 인터페이스로 고정해 다른 플랫폼으로 교체 가능한 구조를 유지한다.
     `secrets`: 마스킹 대상(봇토큰·내부경로). 생성 시 주입·보관(§2.1) — 코어의 L-1 진행 마스킹이
     잘라내기 전에 참조하므로 계약면에 노출한다(공유 속성 1개).
@@ -119,6 +120,20 @@ class Adapter(Protocol):
         TextChannel.purge(14일 이내 일괄삭제 + 초과분 개별삭제로 전부 지움). 권한(Manage
         Messages) 없음·오류는 예외를 삼켜 **삭제된 만큼만** 반환(부분 성공 허용)하고 로깅한다.
         """
+        ...
+
+    def play_music(self, channel_id: int, user_id: int) -> str:
+        """음성재생 capability(디스코드 전용) — 호출자(user_id)가 있는 음성채널에서 고정 재생목록을
+        셔플·반복 재생하고 사용자 회신 문자열을 반환한다. 타 어댑터는 미지원(안내 문자열 반환).
+        """
+        ...
+
+    def stop_music(self, channel_id: int) -> str:
+        """음성재생 정지 + 음성채널 퇴장(디스코드 전용). 회신 문자열 반환. 타 어댑터 미지원."""
+        ...
+
+    def skip_music(self, channel_id: int) -> str:
+        """현재 곡을 건너뛰고 다음 곡 재생(디스코드 전용). 회신 문자열 반환. 타 어댑터 미지원."""
         ...
 
 

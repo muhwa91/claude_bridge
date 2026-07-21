@@ -24,6 +24,7 @@ import contextlib
 import json
 import logging
 import queue
+import random
 import re
 import threading
 import urllib.parse
@@ -33,6 +34,8 @@ from pathlib import Path
 from typing import Any
 
 import discord  # 유일한 discord.py import 지점.
+import imageio_ffmpeg  # 번들 ffmpeg 실행파일 경로(FFmpegPCMAudio executable).
+import yt_dlp  # 재생목록·스트림 URL 추출(플랫폼 격리 — 이 파일에만).
 
 # 콜백 코덱(parse_callback/encode_callback)·청킹·다운로드 가드는 플랫폼 무관 정본(§1.3·§2.4)이라
 # 공유 base(adapter)에서 재사용한다 — adapter 는 stdlib 전용이라 여기서 import 해도 추가 런타임
@@ -77,6 +80,8 @@ _EMBED_DESC_LIMIT = 4096  # discord Embed description 한도(§4.1 — 초과분
 # 카테고리명(대소문자·공백 보존). 특수 채널 = (표시명, kind, role tag). 프로젝트 카테고리는 setup 시
 # 폴더명으로 채운다. 텍스트 채널명 = 라벨의 공백·하이픈 제거 붙여쓰기(디스코드 ASCII 소문자화).
 # 재사용=channelID(맵) 1차·_canon 2차, 리네임 판단=**정확 이름 비교**(_canon collapse 함정 회피).
+# 봇 서버 닉네임(on_ready 마다 멱등 고정 — 강퇴/재초대 시 수동 닉이 풀려서). 여기만 바꾸면 끝.
+_BOT_NICKNAME = "치이카와 봇"
 # 카테고리 표시명(이모지·공백·대문자 자유). 기존 카테고리는 코어명(_cat_core: 이모지·기호·공백 제거)
 # 으로 탐색 후 이모지형으로 rename(중복 생성 방지·멱등). 음성 카테고리는 이전 이름 '음성'도 별칭.
 _CAT_SIMPLE = "🗂️ 간단처리"
@@ -198,8 +203,8 @@ def _build_embed(text: str, color: int) -> tuple[Any, str]:
     """상태 텍스트 → (discord.Embed, desc 4096 초과 오버플로 str). 헤더=첫 줄, 본문=나머지(§4.1).
 
     title = 첫 줄에서 대괄호 껍질을 벗긴 상태 요약, desc = 본문. desc 4096 초과분은 반환해
-    호출측이 후속 plain 청크로 흘려보낸다(§2.2 오버플로 재사용). author=claude_bridge — 프로젝트는
-    채널 자체가 맥락이라 생략(§4.1 '가능한 범위만'). 3열 필드·footer 소요시간은 범위 밖(주의점10).
+    호출측이 후속 plain 청크로 흘려보낸다(§2.2 오버플로 재사용). author 라인은 없다(봇 계정명이
+    이미 상단에 뜨므로 중복 — 제거). 3열 필드·footer 소요시간은 범위 밖(주의점10).
     """
     first, _, rest = text.partition("\n")
     title = first.strip().lstrip("[").rstrip("]").strip()
@@ -209,7 +214,6 @@ def _build_embed(text: str, color: int) -> tuple[Any, str]:
         title=title[:_EMBED_TITLE_LIMIT] or None,
         description=body[:_EMBED_DESC_LIMIT] or None,
     )
-    embed.set_author(name="claude_bridge")
     return embed, body[_EMBED_DESC_LIMIT:]
 
 
@@ -239,12 +243,13 @@ def render_view(buttons: list[Button]) -> Any:
     return view
 
 
-def _is_project_list(buttons: list[Button] | None) -> bool:
-    """버튼 묶음이 프로젝트 선택 목록인가(전부 action=="p"). 세로 1열 V2 렌더 트리거(계약 무변경).
+def _is_vertical_list(buttons: list[Button] | None) -> bool:
+    """버튼 묶음을 세로 1열 V2(LayoutView) 로 렌더할까 — 프로젝트 목록(p:)·선택지(c:) 전용.
 
-    p: 버튼은 프로젝트 선택 전용이라 이 신호만으로 목록을 식별한다(코어 send(text,buttons) 무변경).
+    둘 다 항목 수가 가변(프로젝트 7+·선택지 N+직접입력)이라 classic View 5행 한도를 넘을 수 있어
+    세로 V2 로 편다. push/취소/알림/오라클 등 고정 소수 버튼은 현행 가로(classic) 유지(계약 무변경).
     """
-    return buttons is not None and len(buttons) > 0 and all(b.action == "p" for b in buttons)
+    return buttons is not None and len(buttons) > 0 and all(b.action in {"p", "c"} for b in buttons)
 
 
 def render_project_view(header: str, buttons: list[Button]) -> Any:
@@ -280,6 +285,7 @@ class DiscordAdapter:
         *,
         limit: int = DISCORD_LIMIT,
         channel_map_file: Path | None = None,
+        music_playlist_url: str = "",
     ) -> None:
         self.token = token
         self.secrets = secrets
@@ -305,6 +311,21 @@ class DiscordAdapter:
             load_channel_map(channel_map_file) if channel_map_file else {}
         )
         self._project_names: list[str] = []
+        # 세로 목록으로 발송한 V2 메시지 id — Discord 는 IS_COMPONENTS_V2 flag 를 생성 시 고정해
+        # edit 로 classic 전환을 막는다. 그래서 이 id 들은 edit 도 V2 로 유지한다(선택지 갱신·제거).
+        # ponytail: 세션당 선택지/목록 수만큼 정수가 쌓이나(개인 봇·재시작 소멸) 무해 — 커지면 정리.
+        self._v2_messages: set[int] = set()
+        # ── 음악 재생('/노래') 상태(디스코드 음성 capability, 이 어댑터에만) ──────────────
+        # 재생목록 URL 은 고정(.env MUSIC_PLAYLIST_URL). ffmpeg 는 imageio_ffmpeg 번들 실행파일.
+        # 재생은 단일 길드·단일 음성연결이라 굵은 인스턴스 상태로 충분(봇 1대·동시 재생 1건).
+        # ponytail: 단일 재생 세션 가정 — 다중 길드 동시재생이 필요해지면 길드별 상태 맵으로.
+        self._music_playlist_url = music_playlist_url
+        self._ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        self._voice: Any = None  # discord.VoiceClient(재생 중일 때만)
+        self._music_entries: list[dict[str, Any]] = []  # 셔플된 flat 재생목록 엔트리
+        self._music_index = 0
+        self._music_stopping = False  # 정지 중 플래그(_after 가 advance 하지 않게)
+        self._music_text_ch = 0  # 재생 시작 채널(로그·향후 통지용)
         intents = discord.Intents.default()
         intents.message_content = True  # on_message 본문 수신 필수(Developer Portal 도 켜야 함).
         self._client = discord.Client(intents=intents)
@@ -339,6 +360,190 @@ class DiscordAdapter:
         """
         result = self._run(self._purge_coro(channel_id))
         return result if isinstance(result, int) else 0
+
+    # ── 음악 재생('/재생'·'/정지'·'/다음') capability(디스코드 음성) ──────────────
+    def play_music(self, channel_id: int, user_id: int) -> str:
+        """호출자(user_id)가 있는 음성채널에서 고정 재생목록을 셔플·반복 재생. 회신 문자열 반환.
+        _run 이 루프 미준비·예외를 삼켜 None 을 줄 수 있으므로 str 아니면 안내 폴백.
+        """
+        r = self._run(self._music_play_coro(channel_id, user_id), timeout=60)
+        return r if isinstance(r, str) else "⚠️ 음악 재생 중 오류가 발생했습니다."
+
+    def stop_music(self, channel_id: int) -> str:  # noqa: ARG002 (Protocol 계약 시그니처)
+        """재생 정지 + 음성채널 퇴장. 회신 문자열 반환(폴백은 안내). 단일 세션이라 채널 무관."""
+        r = self._run(self._music_stop_coro(), timeout=60)
+        return r if isinstance(r, str) else "⚠️ 음악 재생 중 오류가 발생했습니다."
+
+    def skip_music(self, channel_id: int) -> str:  # noqa: ARG002 (Protocol 계약 시그니처)
+        """현재 곡 건너뛰기(→ after 가 다음 곡 재생). 회신 문자열 반환(폴백은 안내). 채널 무관."""
+        r = self._run(self._music_skip_coro(), timeout=60)
+        return r if isinstance(r, str) else "⚠️ 음악 재생 중 오류가 발생했습니다."
+
+    def _caller_voice_channel(self, user_id: int) -> Any:
+        """호출자(user_id)가 접속해 있는 음성채널을 첫 길드에서 찾는다(없으면 None).
+
+        voice_states 는 default 인텐트라 members 특권 인텐트 없이 조회 가능(각 채널의 members).
+        """
+        guild = self._client.guilds[0] if self._client.guilds else None
+        if guild is None:
+            return None
+        return next(
+            (v for v in guild.voice_channels if any(m.id == user_id for m in v.members)),
+            None,
+        )
+
+    def _extract_flat(self) -> list[dict[str, Any]]:
+        """재생목록을 flat 추출(곡별 스트림 URL 은 재생 직전 지연 해석). 매 재생 시 재로드."""
+        opts = {"extract_flat": "in_playlist", "quiet": True, "skip_download": True}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(self._music_playlist_url, download=False)
+        entries = (info or {}).get("entries") or []
+        return [e for e in entries if isinstance(e, dict)]
+
+    def _extract_stream(self, entry: dict[str, Any]) -> str:
+        """flat 엔트리 → 재생 가능한 오디오 스트림 URL(재생 직전 해석). url/id 키 방어적 사용."""
+        ref = entry.get("url") or entry.get("id")
+        with yt_dlp.YoutubeDL({"format": "bestaudio/best", "quiet": True}) as ydl:
+            info = ydl.extract_info(ref, download=False)
+        return str(info["url"])
+
+    async def _music_play_coro(self, channel_id: int, user_id: int) -> str:
+        if not self._music_playlist_url:
+            return "⚠️ 재생목록이 설정되지 않았습니다."
+        ch = self._caller_voice_channel(user_id)
+        if ch is None:
+            return "🔊 먼저 음성채널에 들어가 주세요."
+        if self._voice is not None and self._voice.is_connected():
+            return "🎵 이미 재생 중입니다."
+        loop = asyncio.get_running_loop()
+        try:
+            flat = await loop.run_in_executor(None, self._extract_flat)
+        except Exception as e:  # yt-dlp 추출 실패(네트워크·차단 등) — 접속 안 하고 안내
+            log.warning("재생목록 추출 실패: %s", type(e).__name__)
+            flat = []
+        if not flat:
+            return "⚠️ 재생목록을 불러오지 못했습니다."
+        self._voice = await ch.connect(timeout=30.0, reconnect=True)
+        conn = getattr(self._voice, "_connection", None)
+        log.info("음성 연결됨 can_encrypt=%s", getattr(conn, "can_encrypt", None))
+        await self._await_dave_ready()
+        random.shuffle(flat)
+        self._music_entries = flat
+        self._music_index = 0
+        self._music_stopping = False
+        self._music_text_ch = channel_id
+        await self._play_current()
+        return f"▶️ Play - {len(flat)}곡"
+
+    async def _await_dave_ready(self) -> None:
+        """E2EE(DAVE) 음성채널이면 재생 전 세션 준비(can_encrypt)를 최대 ~15초 폴링한다.
+
+        디스코드 음성채널은 기본 E2EE(DAVE 프로토콜). DAVE 세션이 준비되기 전에 voice.play() 하면
+        봇이 비암호 opus 를 흘려 디스코드가 전량 폐기 → 에러 없이 무음(after 미발화). 이 대기가
+        핵심 수정. 내부 속성(_connection·can_encrypt·dave_protocol_version)은 discord.py 버전 변동에
+        취약하니 방어적 getattr + try/except — 속성이 없으면 대기를 스킵하고 진행(구조 깨짐 방지).
+        준비를 15초 내 못 하면 막지 않고 best-effort 재생(로그로 확증 가능).
+        """
+        try:
+            conn = getattr(self._voice, "_connection", None)
+            if not getattr(conn, "dave_protocol_version", None):
+                return  # 0/None = E2EE 아님 → 대기 불필요
+            for _ in range(30):  # 0.5s * 30 = 15s 상한(바운드 폴링)
+                if getattr(conn, "can_encrypt", False):
+                    return
+                await asyncio.sleep(0.5)
+            log.warning("DAVE 준비 안됨 — 재생 시도(무음 가능)")
+        except Exception as e:  # 내부 속성 구조 변동 — 대기 스킵하고 진행(best-effort)
+            log.warning("DAVE 준비 확인 실패(대기 스킵): %s", type(e).__name__)
+
+    async def _play_current(self) -> None:
+        """현재 인덱스 곡의 스트림을 해석해 재생. 스트림 해석 실패 곡은 건너뛰고 다음으로 진행."""
+        loop = asyncio.get_running_loop()
+        while self._music_entries and not self._music_stopping:
+            entry = self._music_entries[self._music_index]
+            try:
+                url = await loop.run_in_executor(None, self._extract_stream, entry)
+            except Exception as e:  # 개별 곡 스트림 실패 — 그 곡만 skip 하고 다음 곡 시도
+                log.warning("곡 스트림 해석 실패(skip): %s", type(e).__name__)
+                self._music_index += 1
+                if self._music_index >= len(self._music_entries):
+                    random.shuffle(self._music_entries)
+                    self._music_index = 0
+                continue
+            src = discord.FFmpegPCMAudio(
+                url,
+                executable=self._ffmpeg,
+                before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                options="-vn",
+            )
+            conn = getattr(self._voice, "_connection", None)
+            log.info(
+                "voice.play 호출 can_encrypt=%s proto=%s",
+                getattr(conn, "can_encrypt", None),
+                getattr(conn, "dave_protocol_version", None),
+            )
+            self._voice.play(src, after=self._after)
+            return
+
+    def _after(self, err: Exception | None) -> None:
+        """재생 완료 콜백(discord 워커 스레드) — 정지 중이 아니면 다음 곡으로. 루프에 스케줄만.
+
+        err=None(정상 종료)도 info 로 남긴다 — 콜백 발화 여부가 무음 진단의 핵심 신호(재발방지).
+        """
+        if err is not None:
+            log.warning("재생 콜백 오류: %s", type(err).__name__, exc_info=err)
+        else:
+            log.info("재생 콜백 발화(정상 종료)")
+        if self._music_stopping or self._voice is None or self._loop is None:
+            return
+        asyncio.run_coroutine_threadsafe(self._advance(), self._loop)
+
+    async def _advance(self) -> None:
+        """다음 곡으로(끝이면 재셔플·처음부터 = 무한 반복)."""
+        if self._music_stopping:
+            return
+        self._music_index += 1
+        if self._music_index >= len(self._music_entries):
+            random.shuffle(self._music_entries)
+            self._music_index = 0
+        await self._play_current()
+
+    async def _music_skip_coro(self) -> str:
+        if self._voice is None or not self._voice.is_connected():
+            return "⏹️ 재생 중인 곡이 없습니다."
+        self._voice.stop()  # → _after → _advance 로 다음 곡
+        return "⏭️ 다음 곡을 재생합니다."
+
+    async def _music_stop_coro(self) -> str:
+        if self._voice is None or not self._voice.is_connected():
+            return "⏹️ 재생 중인 곡이 없습니다."
+        self._music_stopping = True  # _after 가 advance 하지 않게 먼저 세팅
+        self._voice.stop()
+        await self._voice.disconnect()
+        self._voice = None
+        self._music_entries = []
+        self._music_index = 0
+        return "⏹️ 음악 재생을 마칩니다."
+
+    async def _ensure_nickname(self) -> None:
+        """봇 서버 닉을 _BOT_NICKNAME 으로 고정(멱등). 강퇴/재초대로 풀린 닉을 on_ready 마다 회복.
+
+        이미 같으면 skip(불필요 edit·레이트리밋 회피). Change Nickname 권한 없으면 Forbidden(=
+        DiscordException 하위) → 로그+계속. 과거 Manage Messages 없어 청소가 조용히 실패한 전례가
+        있어, 닉도 안 되면 개발자가 알도록 경고를 남긴다(봇 크래시·on_ready 중단 없이).
+        """
+        for guild in self._client.guilds:
+            me = guild.me
+            if me is None or me.nick == _BOT_NICKNAME:
+                continue
+            try:
+                await me.edit(nick=_BOT_NICKNAME)
+            except discord.DiscordException as e:
+                log.warning(
+                    "서버 닉 고정 실패 guild=%s(%s) — Change Nickname 권한 확인 필요",
+                    guild.id,
+                    type(e).__name__,
+                )
 
     async def _ensure_channels(self) -> None:
         """F1: on_ready 재진입 직렬화(재접속 중복생성 경쟁 차단) 후 실제 셋업. 셋업 경로 전용."""
@@ -538,7 +743,11 @@ class DiscordAdapter:
     def _register_events(self) -> None:
         @self._client.event
         async def on_ready() -> None:
-            # 접속 후 채널 자동생성(1회) — 실패해도 _ready 는 세팅(폴백: 채널명 매칭).
+            # 접속 후 닉 고정 → 채널 자동생성(각 1회). 서로·부팅 안 막게 예외 격리(_ready 항상 set).
+            try:
+                await self._ensure_nickname()
+            except Exception as e:  # 닉 실패가 채널 셋업·부팅을 막지 않게 격리(로그+계속)
+                log.warning("서버 닉 고정 실패(%s) — 계속", type(e).__name__)
             try:
                 await self._ensure_channels()
             except Exception as e:  # 권한 없음·API 오류 등 — 로그+계속(브리지 안 죽게)
@@ -715,13 +924,18 @@ class DiscordAdapter:
     def send(self, channel_id: int, text: str, buttons: list[Button] | None = None) -> int | None:
         """마스킹 후 청크 분할 전송. 버튼은 마지막 청크에만. 첫 청크 message_id 반환(실패 None).
 
-        예외: 프로젝트 목록(전부 p: 액션)은 세로 1열 V2 LayoutView 로 렌더(헤더 텍스트도 흡수).
+        예외: 세로 목록(전부 p:/c: 액션)은 세로 1열 V2 LayoutView 로 렌더(헤더 텍스트도 흡수).
+        V2 flag 는 메시지 생성 시 고정(edit 로 classic 전환 불가)이라, 그 id 를 _v2_messages 에
+        기록해 이후 edit 도 V2 로 유지한다(선택지 갱신·버튼 제거 편집이 400 나지 않게).
         """
-        if _is_project_list(buttons):
-            assert buttons is not None  # _is_project_list 가 보장(mypy 좁히기)
+        if _is_vertical_list(buttons):
+            assert buttons is not None  # _is_vertical_list 가 보장(mypy 좁히기)
             view = render_project_view(mask_secrets(text, self.secrets), buttons)
             mid = self._run(self._send_view_coro(channel_id, view))
-            return mid if isinstance(mid, int) else None
+            mid = mid if isinstance(mid, int) else None
+            if mid is not None:
+                self._v2_messages.add(mid)
+            return mid
         return self._emit(text, buttons, lambda body, view: self._send_coro(channel_id, body, view))
 
     def edit(
@@ -735,7 +949,15 @@ class DiscordAdapter:
 
         상태 헤더면 첫 파트가 Embed 라 진행(노랑)→완료(초록)/실패(빨강) 전이가 같은 message_id
         편집으로 색만 바뀐다(§4.0 상태 전이=같은 메시지 편집).
+
+        예외: send 가 V2(세로 목록)로 만든 메시지는 flag 가 고정이라 classic 으로 못 돌린다 →
+        같은 세로 V2 로 편집한다(버튼 갱신·제거·만료 문구 모두 TextDisplay 흡수). buttons 없으면
+        빈 목록으로 렌더해 버튼만 사라진다(텍스트는 유지).
         """
+        if message_id in self._v2_messages:
+            view = render_project_view(mask_secrets(text, self.secrets), buttons or [])
+            self._run(self._edit_view_coro(channel_id, message_id, view))
+            return
         parts = self._render_parts(text)
         last = len(parts) - 1
         head_view = render_view(buttons) if buttons is not None and last == 0 else None
@@ -794,11 +1016,14 @@ class DiscordAdapter:
             self._thread.join(timeout=5)
 
     # ── asyncio↔동기 경계 헬퍼(§3.2) ──────────────────────────────────────────
-    def _run(self, coro: Coroutine[Any, Any, Any]) -> Any:
+    def _run(self, coro: Coroutine[Any, Any, Any], timeout: float = _CALL_TIMEOUT) -> Any:
         """코루틴을 봇 이벤트루프에 밀어넣고 완료까지 동기 대기. 실패는 로그+None(§3.3, 루프 보호).
 
         플랫폼 오류(rate-limit·네트워크·루프 사망)는 어댑터가 삼키고 로그만 남긴다(코어 직렬 루프
         보호). 그래서 광범위 except — send/edit/ack 계약이 "실패는 로그·None"이기 때문(§3.3).
+
+        timeout 은 per-call — 기본은 REST 용 _CALL_TIMEOUT(30) 이나, 음성 경로(connect+DAVE 대기+
+        추출)는 30초를 넘을 수 있어 play/stop/skip 은 넉넉히 넘긴다(§ 음악 재생).
         """
         loop = self._loop
         if loop is None or not loop.is_running():
@@ -807,7 +1032,7 @@ class DiscordAdapter:
             return None
         try:
             fut = asyncio.run_coroutine_threadsafe(coro, loop)
-            return fut.result(timeout=_CALL_TIMEOUT)
+            return fut.result(timeout=timeout)
         except Exception as e:  # §3.3: 모든 플랫폼 오류를 삼키고 로그(코어 직렬 루프 보호)
             log.warning("디스코드 호출 실패: %s", type(e).__name__)
             return None
@@ -826,6 +1051,13 @@ class DiscordAdapter:
         )
         msg = await channel.send(view=view)
         return int(msg.id)
+
+    async def _edit_view_coro(self, channel_id: int, message_id: int, view: Any) -> None:
+        """V2 LayoutView 전용 편집(content/embed 없음 — V2 는 content 를 못 실어 view 만 교체)."""
+        channel = self._client.get_channel(channel_id) or await self._client.fetch_channel(
+            channel_id
+        )
+        await channel.get_partial_message(message_id).edit(view=view)
 
     async def _edit_coro(self, channel_id: int, message_id: int, payload: Any, view: Any) -> None:
         channel = self._client.get_channel(channel_id) or await self._client.fetch_channel(

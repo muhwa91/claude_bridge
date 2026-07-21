@@ -11,7 +11,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import bridge
@@ -32,7 +32,7 @@ from bridge import (
     due_snoozes,
     event_to_progress,
     fetch_stock,
-    format_oracle_status,
+    format_oracle_ga_status,
     format_reply,
     handle_event,
     is_allowed,
@@ -75,6 +75,7 @@ class FakeAdapter:
         self.saves = []  # dispatch/nb 상태 저장 스파이용(테스트가 채움)
         self.runs = []  # run_claude_with_progress 스파이용(테스트가 채움)
         self.setup_names = None  # setup_channels 스파이
+        self.music = []  # (action, *args) 음악 capability 호출 스파이(play/stop/skip)
         self._roles = roles or {}  # role -> channel_id(#알림·#봇상태 라우팅)
         self._projects = projects or {}  # 프로젝트명 -> channel_id(예약 확인 실행 라우팅)
         self._send_ids = iter(send_ids) if send_ids is not None else None
@@ -118,6 +119,18 @@ class FakeAdapter:
     def clear_channel(self, channel_id):
         self.cleared.append(channel_id)
         return self._clear_count
+
+    def play_music(self, channel_id, user_id):
+        self.music.append(("play", channel_id, user_id))
+        return "▶️ 재생 시작"
+
+    def stop_music(self, channel_id):
+        self.music.append(("stop", channel_id))
+        return "⏹️ 정지"
+
+    def skip_music(self, channel_id):
+        self.music.append(("skip", channel_id))
+        return "⏭️ 다음"
 
 
 def _btn(user_id, action, arg="", *, message_id=99, callback_id="cq1", channel_id=None):
@@ -275,14 +288,10 @@ def test_parse_message_sentence_with_push_word_still_parses():
 
 
 def test_push_words_exact_match_only():
-    assert "푸시해" in bridge.PUSH_WORDS
+    # 개발자 지시(2026-07-22): '푸시해줘' 단일 통일. 옛 변형(push·푸시·푸쉬…)은 제거.
+    assert frozenset({"푸시해줘"}) == bridge.PUSH_WORDS
+    assert "push" not in bridge.PUSH_WORDS
     assert "기록해주고 푸시해줘" not in bridge.PUSH_WORDS
-    assert "push" in bridge.PUSH_WORDS
-
-
-def test_push_word_casefold_matches_uppercase():
-    for variant in ("Push", "PUSH", "pUsH"):
-        assert variant.casefold() in bridge.PUSH_WORDS
 
 
 def _fold(s):
@@ -290,8 +299,7 @@ def _fold(s):
 
 
 def test_push_word_inner_space_folded():
-    for variant in ("푸시 해줘", "푸시 해", "푸 시", "PUSH  "):
-        assert _fold(variant) in bridge.PUSH_WORDS
+    assert _fold("푸시 해줘") in bridge.PUSH_WORDS  # 공백접기로 "푸시 해줘"도 커버
     assert _fold("기록해주고 푸시해줘") not in bridge.PUSH_WORDS
 
 
@@ -1244,6 +1252,75 @@ def test_clean_ok_disallowed_user_blocked():
     assert a.cleared == [] and a.sent == []
 
 
+# ---------------------------------------------------------------------------
+# 음악 재생('/재생'·'/정지'·'/다음') — music_action 판정(순수) + adapter capability 위임
+# ---------------------------------------------------------------------------
+
+
+def test_music_action_play_words():
+    assert bridge.music_action("/재생") == "play"
+
+
+def test_music_action_stop_words():
+    assert bridge.music_action("/정지") == "stop"
+
+
+def test_music_action_skip_words():
+    assert bridge.music_action("/다음") == "skip"
+
+
+def test_music_action_sentence_not_command():
+    # 오탐 가드: 문장/평문은 명령 아님(슬래시 3종 단독 정확매칭만).
+    # 폐기된 옛 별칭(/노래·/그만·노래다음 등)도 더는 발동하지 않아야 한다(별칭 폐기 회귀).
+    for word in (
+        "노래 추천해줘",
+        "노래 가사 알려줘",
+        "이 노래 뭐야",
+        "/노래",
+        "노래",
+        "/그만",
+        "그만",
+        "노래다음",
+        "다음곡",
+    ):
+        assert bridge.music_action(word) is None
+
+
+def test_music_play_delegates_to_adapter():
+    a = FakeAdapter()
+    _fire(a, _txt(777, "/재생"), target_root="root")
+    assert a.music == [("play", 777, 777)]  # play_music(channel_id, user_id)
+    assert a.sent == [(777, "▶️ 재생 시작", None)]  # 반환 문자열을 회신
+
+
+def test_music_stop_delegates_to_adapter():
+    a = FakeAdapter()
+    _fire(a, _txt(777, "/정지"), target_root="root")
+    assert a.music == [("stop", 777)]
+    assert a.sent == [(777, "⏹️ 정지", None)]
+
+
+def test_music_skip_delegates_to_adapter():
+    a = FakeAdapter()
+    _fire(a, _txt(777, "/다음"), target_root="root")
+    assert a.music == [("skip", 777)]
+    assert a.sent == [(777, "⏭️ 다음", None)]
+
+
+def test_music_disallowed_user_no_reply():
+    # 인가 게이트 회귀: 비허용 user 의 '/재생'은 무회신·미위임.
+    a = FakeAdapter()
+    _fire(a, _txt(999, "/재생"), allowed=_ALLOWED, target_root="root")
+    assert a.music == [] and a.sent == []
+
+
+def test_music_command_not_help_fallthrough():
+    # '/재생'이 cmd.startswith('/')·not in COMMANDS → HELP 폴백으로 새지 않는지(삽입위치 회귀).
+    a = FakeAdapter()
+    _fire(a, _txt(777, "/재생"), target_root="root")
+    assert all(t != bridge.HELP_TEXT for _c, t, _b in a.sent)
+
+
 def test_restart_helper_writes_marker_closes_exits(monkeypatch, tmp_path):
     p = tmp_path / "restart_notice.json"
     monkeypatch.setattr(bridge, "RESTART_NOTICE_FILE", p)
@@ -1400,6 +1477,58 @@ def test_run_claude_no_result_falls_back_to_stderr(tmp_path):
     data = run_claude(exe, str(tmp_path), "NO_RESULT crash", timeout=30)
     assert data.get("is_error") is True
     assert "fatal" in str(data.get("result", ""))
+
+
+# ===========================================================================
+# 프로젝트별 추가 화이트리스트 병합(PROJECT_EXTRA_TOOLS) — argv 스파이로 잠금
+# ===========================================================================
+
+
+def _capture_argv(monkeypatch):
+    """subprocess.Popen 를 스파이로 대체 — cmd 를 잡고 OSError 로 즉시 반환시킨다(스레드 미기동)."""
+    captured = {}
+
+    def fake_popen(cmd, **_kw):
+        captured["cmd"] = cmd
+        raise OSError("captured")
+
+    monkeypatch.setattr(bridge.subprocess, "Popen", fake_popen)
+    return captured
+
+
+def _allowed_tools_argv(cmd):
+    return cmd[cmd.index("--allowedTools") + 1 :]  # 도구 목록은 argv 말미(resume 미사용 시)
+
+
+def test_run_claude_trading_info_adds_narrowed_test_runners(monkeypatch, tmp_path):
+    cap = _capture_argv(monkeypatch)
+    run_claude("claude", str(tmp_path / "trading_info"), "task", timeout=30)
+    tools = _allowed_tools_argv(cap["cmd"])
+    # 좁힌 테스트 명령 prefix 만 들어간다(인자는 prefix 매칭이 자동 커버).
+    assert "Bash(php artisan test:*)" in tools
+    assert "Bash(php vendor/bin/phpunit:*)" in tools
+    assert "Bash(npm run test:*)" in tools
+    assert "Bash(npx vitest:*)" in tools
+    assert "Bash(pytest *)" in tools  # 기본 화이트리스트도 유지
+    # 넓은 와일드카드(php -r RCE·npm install·임의 npx)는 절대 안 들어간다.
+    assert "Bash(php:*)" not in tools
+    assert "Bash(npm:*)" not in tools
+    assert "Bash(npx:*)" not in tools
+
+
+def test_run_claude_other_project_no_extra_tools(monkeypatch, tmp_path):
+    cap = _capture_argv(monkeypatch)
+    run_claude("claude", str(tmp_path / "etf_info"), "task", timeout=30)
+    tools = _allowed_tools_argv(cap["cmd"])
+    assert tools == bridge.ALLOWED_TOOLS  # 확장 없음 = 기본 그대로
+    assert not any("artisan" in t or "vitest" in t for t in tools)
+
+
+def test_run_claude_explicit_scope_not_extended(monkeypatch, tmp_path):
+    # 명시 스코프(사진 대조 ["Read"])는 trading_info 라도 확장하지 않는다.
+    cap = _capture_argv(monkeypatch)
+    run_claude("claude", str(tmp_path / "trading_info"), "task", timeout=30, allowed_tools=["Read"])
+    assert _allowed_tools_argv(cap["cmd"]) == ["Read"]
 
 
 # ===========================================================================
@@ -2218,47 +2347,50 @@ def test_photo_non_trading_without_caption_guides(photo_env, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# #4b 오라클 상태 조회 — format_oracle_status(순수) + `오라클` 평문 명령(claude 미실행)
+# #4b 오라클 상태 조회 — format_oracle_ga_status(순수, GitHub Actions) + `오라클` 명령
 # ---------------------------------------------------------------------------
 
-
-def _write_oracle(tmp_path, payload):
-    p = tmp_path / "status.json"
-    p.write_text(json.dumps(payload), encoding="utf-8")
-    return p
+_OC_NOW = datetime(2026, 7, 21, 15, 0, tzinfo=UTC)
 
 
-def test_oracle_status_success(tmp_path):
-    p = _write_oracle(tmp_path, {"success": True, "public_ip": "1.2.3.4", "attempts": 42})
-    out = format_oracle_status(p)
-    assert "🎉" in out and "1.2.3.4" in out and "42회" in out
+def test_oracle_ga_running():
+    # 최초 시작 13:57 → now 15:00 = 63분 = 63회, 1시간 3분째. failure 실행은 무시(진행중이 있음).
+    runs = [
+        {"startedAt": "2026-07-21T13:57:00Z", "status": "in_progress", "conclusion": None},
+        {"startedAt": "2026-07-21T14:30:00Z", "status": "completed", "conclusion": "failure"},
+    ]
+    out = format_oracle_ga_status(runs, _OC_NOW)
+    assert "⏰ 오라클 자동 재시도" in out
+    assert "약 63회 시도" in out
+    assert "1시간 3분째" in out
+    assert "재고 대기중" in out
 
 
-def test_oracle_status_error(tmp_path):
-    p = _write_oracle(tmp_path, {"success": False, "error": "예산 초과"})
-    out = format_oracle_status(p)
-    assert out == "⛔ 오라클 자동 재시도 중단: 예산 초과"
+def test_oracle_ga_not_running():
+    # 모두 완료 → 진행 status 없음 → 안 돎 안내.
+    runs = [{"startedAt": "2026-07-21T13:57:00Z", "status": "completed", "conclusion": "success"}]
+    out = format_oracle_ga_status(runs, _OC_NOW)
+    assert out == bridge._ORACLE_NOT_RUNNING
 
 
-def test_oracle_status_running(tmp_path):
-    p = _write_oracle(
-        tmp_path,
-        {"running": True, "attempts": 42, "elapsed_min": 63, "last_code": "재고 부족"},
-    )
-    out = format_oracle_status(p)
-    assert "⏰" in out and "42회" in out and "1시간 3분째" in out and "재고 부족" in out
+def test_oracle_ga_empty():
+    assert format_oracle_ga_status([], _OC_NOW) == bridge._ORACLE_NOT_RUNNING
 
 
-def test_oracle_status_missing_file(tmp_path):
-    out = format_oracle_status(tmp_path / "nope.json")
-    assert out == "오라클 자동 재시도 정보가 없습니다(런처 미가동)."
+def test_oracle_ga_cancelled_excluded():
+    # cancelled(테스트 취소분, 10:00)은 시작시각 계산서 제외 → 시작 14:00 = 60분째.
+    runs = [
+        {"startedAt": "2026-07-21T10:00:00Z", "status": "completed", "conclusion": "cancelled"},
+        {"startedAt": "2026-07-21T14:00:00Z", "status": "in_progress", "conclusion": None},
+    ]
+    out = format_oracle_ga_status(runs, _OC_NOW)
+    assert "약 60회 시도" in out  # 10:00 포함이면 300회였을 것
+    assert "1시간 0분째" in out
 
 
 def test_oracle_command_replies_without_running_claude(monkeypatch, tmp_path):
-    # `오라클` 로 시작하는 메시지는 claude 작업이 아니라 status.json 상태 회신(런처 조회).
-    payload = {"running": True, "attempts": 7, "elapsed_min": 5, "last_code": "x"}
-    p = _write_oracle(tmp_path, payload)
-    monkeypatch.setattr(bridge, "ORACLE_STATUS_FILE", p)
+    # `오라클` 단독 매칭 → gh 조회 회신(oracle_status_reply 스텁), claude 미실행.
+    monkeypatch.setattr(bridge, "oracle_status_reply", lambda: "⏰ 오라클 자동 재시도")
     ran = []
     monkeypatch.setattr(bridge, "run_claude_with_progress", lambda *_a, **_k: ran.append(1))
     a = FakeAdapter()
@@ -2269,9 +2401,7 @@ def test_oracle_command_replies_without_running_claude(monkeypatch, tmp_path):
 
 def test_oracle_command_not_fired_on_sentence(monkeypatch, tmp_path):
     # "오라클 …" 로 시작해도 문장이면 상태조회 미발동(startswith 오탐 회귀 방지).
-    payload = {"running": True, "attempts": 7, "elapsed_min": 5, "last_code": "x"}
-    p = _write_oracle(tmp_path, payload)
-    monkeypatch.setattr(bridge, "ORACLE_STATUS_FILE", p)
+    monkeypatch.setattr(bridge, "oracle_status_reply", lambda: "⏰ 오라클 자동 재시도")
     a = FakeAdapter()
     _fire(
         a,

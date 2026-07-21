@@ -477,9 +477,7 @@ def test_status_color_matches_headers_and_leaders():
     assert sc(f"{HEADER_DONE}\n\n끝") == discord_adapter._COLOR_DONE  # 초록
     assert sc(f"{HEADER_FAIL}\n\n실패") == discord_adapter._COLOR_FAIL  # 빨강
     assert sc(f"{HEADER_NOTE}\n\n확인") == discord_adapter._COLOR_INFO  # 블러플
-    assert sc("🔄 [proj] 작업 중…") == discord_adapter._COLOR_WAIT  # 진행 노랑
-    assert sc("🔍 [MU] 대조 중…") == discord_adapter._COLOR_WAIT
-    assert sc("🔎 개장 확인 중…") == discord_adapter._COLOR_WAIT
+    assert sc("🔄 작업 중") == discord_adapter._COLOR_WAIT  # 모든 진행 헤더 단일 문구 → 노랑
     assert sc("⏰ 개장 알림\n등락률 확인") == discord_adapter._COLOR_WAIT  # 예약 알림
 
 
@@ -497,7 +495,7 @@ def test_build_embed_title_strips_brackets_desc_is_body():
     assert embed.title == "✅처리완료"  # 대괄호 껍질 제거
     assert embed.description == "README 를 고쳤습니다."
     assert embed.color.value == discord_adapter._COLOR_DONE
-    assert embed.author.name == "claude_bridge"
+    assert embed.author.name is None  # author 라인 제거(봇 계정명 중복)
     assert overflow == ""
 
 
@@ -807,6 +805,51 @@ def test_ensure_channels_no_guild_skips(tmp_path):
     a._client = SimpleNamespace(guilds=[])  # type: ignore[assignment]
     asyncio.run(a._ensure_channels())  # 길드 없음 → 스킵(예외 없이)
     assert a._channel_map == {}
+
+
+# ---------------------------------------------------------------------------
+# on_ready 서버 닉 고정(_ensure_nickname) — 멱등·권한실패 방어
+# ---------------------------------------------------------------------------
+
+
+class _FakeMember:
+    def __init__(self, nick=None, raise_exc=None):
+        self.nick = nick
+        self._raise = raise_exc
+        self.edits = []  # 넘겨받은 nick 기록
+
+    async def edit(self, *, nick):
+        if self._raise is not None:
+            raise self._raise
+        self.edits.append(nick)
+        self.nick = nick
+
+
+def _guild_with_me(me):
+    return SimpleNamespace(id=1, me=me)
+
+
+def test_ensure_nickname_sets_when_different():
+    a = _adapter()
+    me = _FakeMember(nick="옛닉")
+    a._client = SimpleNamespace(guilds=[_guild_with_me(me)])  # type: ignore[assignment]
+    asyncio.run(a._ensure_nickname())
+    assert me.edits == [discord_adapter._BOT_NICKNAME]  # 다르면 edit
+
+
+def test_ensure_nickname_skips_when_already_set():
+    a = _adapter()
+    me = _FakeMember(nick=discord_adapter._BOT_NICKNAME)
+    a._client = SimpleNamespace(guilds=[_guild_with_me(me)])  # type: ignore[assignment]
+    asyncio.run(a._ensure_nickname())
+    assert me.edits == []  # 멱등: 같으면 edit 안 함(레이트리밋 회피)
+
+
+def test_ensure_nickname_swallows_permission_error():
+    a = _adapter()
+    me = _FakeMember(nick="옛닉", raise_exc=discord.DiscordException("no perm"))
+    a._client = SimpleNamespace(guilds=[_guild_with_me(me)])  # type: ignore[assignment]
+    asyncio.run(a._ensure_nickname())  # Forbidden 등 → 삼키고 계속(예외 전파 없음)
 
 
 def test_ensure_channels_channel_create_failure_skips_but_maps_rest(monkeypatch):
@@ -1183,11 +1226,14 @@ def test_render_project_view_nonempty_header_keeps_textdisplay():
     assert any(isinstance(it, discord.ui.TextDisplay) for it in view.children)
 
 
-def test_is_project_list_detects_only_all_p():
-    assert discord_adapter._is_project_list(project_buttons(["a", "b"]))
-    assert not discord_adapter._is_project_list(push_buttons())  # push/x
-    assert not discord_adapter._is_project_list([])
-    assert not discord_adapter._is_project_list(None)
+def test_is_vertical_list_detects_p_and_c():
+    from bridge import choice_buttons
+
+    assert discord_adapter._is_vertical_list(project_buttons(["a", "b"]))  # p:
+    assert discord_adapter._is_vertical_list(choice_buttons(55, [("유지", "keep")]))  # c:
+    assert not discord_adapter._is_vertical_list(push_buttons())  # push/x → 가로 유지
+    assert not discord_adapter._is_vertical_list([])
+    assert not discord_adapter._is_vertical_list(None)
 
 
 def test_send_project_list_routes_to_v2_view_coro():
@@ -1213,3 +1259,50 @@ def test_send_non_project_buttons_still_classic():
     calls = _stub_calls(a, [111])
     a.send(100, HEADER_NOTE + "\n\npush?", push_buttons())  # p: 아님 → classic View 경로
     assert calls[0][0] == "send"  # _send_coro(classic) 사용
+
+
+def test_send_choice_buttons_routes_to_v2_and_tracks_id():
+    from bridge import choice_buttons
+
+    a = _adapter()
+    calls = []
+    a._send_view_coro = lambda cid, view: ("v2", cid, view)  # type: ignore[assignment]
+    a._send_coro = lambda cid, body, view: ("classic", cid, body, view)  # type: ignore[assignment]
+
+    def fake_run(coro):
+        calls.append(coro)
+        return 900
+
+    a._run = fake_run  # type: ignore[assignment]
+    mid = a.send(100, "↳ 택일 하세요:", choice_buttons(0, [("유지", "keep"), ("교체", "swap")]))
+    assert mid == 900
+    assert calls[0][0] == "v2"  # 선택지(c:)도 세로 V2 경로
+    assert isinstance(calls[0][2], discord.ui.LayoutView)
+    assert 900 in a._v2_messages  # 이후 edit 이 V2 로 유지되도록 id 기록
+
+
+def test_edit_tracked_v2_message_routes_to_v2_view_coro():
+    from bridge import choice_buttons
+
+    a = _adapter()
+    a._v2_messages.add(900)  # send 가 V2 로 만든 선택지 메시지라고 가정
+    calls = []
+    a._edit_view_coro = lambda cid, mid, view: ("v2edit", cid, mid, view)  # type: ignore[assignment]
+    a._edit_coro = lambda cid, mid, body, view: ("classicedit", cid, mid, body, view)  # type: ignore[assignment]
+    a._run = lambda coro: calls.append(coro)  # type: ignore[assignment]
+    # 실제 id 로 버튼 갱신(V2→V2)
+    a.edit(100, 900, "↳ 택일 하세요:", choice_buttons(900, [("유지", "keep")]))
+    assert calls[0][0] == "v2edit"
+    assert isinstance(calls[0][3], discord.ui.LayoutView)
+    # 버튼 제거(선택 확정) — buttons=None 도 V2 유지(TextDisplay 만, 400 방지)
+    calls.clear()
+    a.edit(100, 900, "선택: 유지")
+    assert calls[0][0] == "v2edit"
+    assert isinstance(calls[0][3], discord.ui.LayoutView)
+
+
+def test_edit_untracked_message_stays_classic():
+    a = _adapter()
+    calls = _stub_calls(a, [None])
+    a.edit(100, 42, "짧음")  # _v2_messages 에 없음 → classic 경로
+    assert calls[0][0] == "edit"  # _edit_coro(classic)
