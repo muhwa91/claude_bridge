@@ -2103,6 +2103,7 @@ def photo_env(monkeypatch):
     fa = FakeAdapter(secrets=[])
     bridge.channel_sessions.clear()  # _run_with_session 세션 누수 차단(테스트 격리)
     bridge.chat_selection.clear()
+    bridge.pending_photos.clear()  # ⑥ 보류 사진 누수 차단(테스트 격리)
 
     def fake_run(*args, **_k):
         # (adapter, channel_id, header, exe, proj, task, timeout, allowed_tools?)
@@ -2119,13 +2120,26 @@ def photo_env(monkeypatch):
     return fa
 
 
-def test_photo_no_caption_guides_no_run(photo_env, tmp_path):
-    # 사진만(캡션 없음) → 실행·다운로드 없이 안내 1줄.
+def test_photo_no_caption_holds_pending_no_run(photo_env, tmp_path):
+    # ⑥ 사진만(캡션 없음) → 폐기 대신 채널별 보류 + 안내 1줄. 실행·다운로드는 소비 시점에.
     (tmp_path / "trading_info").mkdir()
     _fire(photo_env, _photo(777, caption=None), repo_root=tmp_path, target_root=str(tmp_path))
     assert photo_env.runs == []
-    assert photo_env.fetched == []  # 캡션 없으면 다운로드조차 안 함
-    assert any("지시를 적어" in t for _c, t, _b in photo_env.sent)
+    assert photo_env.fetched == []  # 캡션 없으면 다운로드는 소비 시점에(지금 안 함)
+    assert bridge.pending_photos[777][0] == "f"  # photo_ref 보류
+    assert any("받아뒀" in t for _c, t, _b in photo_env.sent)
+
+
+def test_photo_no_caption_no_ref_reads_error(photo_env, tmp_path):
+    # 캡션 없고 photo_ref 도 None → 보류 없이 읽기 실패 안내(None 을 보류하지 않음).
+    _fire(
+        photo_env,
+        _photo(777, caption=None, photo_ref=None),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert 777 not in bridge.pending_photos
+    assert any("읽지 못" in t for _c, t, _b in photo_env.sent)
 
 
 def test_photo_no_photo_ref_prompts_no_run(photo_env, tmp_path):
@@ -2206,6 +2220,157 @@ def test_photo_no_project_no_selection_guides(photo_env, tmp_path):
     assert photo_env.runs == []
     assert photo_env.fetched == []
     assert any("프로젝트를 선택" in t for _c, t, _b in photo_env.sent)
+
+
+def test_pending_photo_consumed_by_next_free_text(photo_env, tmp_path):
+    # ⑥ 사진 보류 → 다음 자유 지시가 소비: 사진과 묶여 경로 주입·실행, 보류 해제·소비 시 다운로드.
+    (tmp_path / "trading_info").mkdir()
+    bridge.chat_selection[777] = "trading_info"  # 채널 프로젝트 선택
+    _fire(photo_env, _photo(777, caption=None), repo_root=tmp_path, target_root=str(tmp_path))
+    assert photo_env.runs == []  # 보류만(아직 실행 안 함)
+    _fire(photo_env, _txt(777, "MU 값 대조해줘"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert len(photo_env.runs) == 1
+    assert "MU 값 대조해줘" in photo_env.runs[0]["task"]  # 다음 텍스트가 지시로 주입
+    assert "x.jpg" in photo_env.runs[0]["task"]  # 보류 사진 경로 주입
+    assert photo_env.fetched  # 소비 시점에 다운로드
+    assert 777 not in bridge.pending_photos  # 보류 해제
+
+
+def test_pending_photo_expired_falls_through_to_text(photo_env, tmp_path):
+    # ⑥ TTL 초과 후 텍스트 → 보류 무시·일반 텍스트 처리(사진 주입·다운로드 없음), 만료분 정리.
+    (tmp_path / "trading_info").mkdir()
+    bridge.chat_selection[777] = "trading_info"
+    bridge.pending_photos[777] = ("f", time.monotonic() - bridge.PENDING_PHOTO_TTL_SEC - 1)
+    _fire(photo_env, _txt(777, "그냥 텍스트 지시"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert len(photo_env.runs) == 1
+    assert "x.jpg" not in photo_env.runs[0]["task"]  # 사진 주입 없음
+    assert photo_env.fetched == []  # 사진 다운로드 안 함
+    assert 777 not in bridge.pending_photos  # 만료분 정리
+
+
+def test_pending_photo_kept_when_command(photo_env, tmp_path):
+    # ⑥ 보류 중 명령(ㅁ프로젝트) → 명령 정상 처리, 보류는 유지(TTL 자연 소멸 대상).
+    (tmp_path / "trading_info").mkdir()
+    bridge.pending_photos[777] = ("f", time.monotonic())
+    _fire(photo_env, _txt(777, "ㅁ프로젝트"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert photo_env.runs == []  # 사진 실행 안 함
+    assert 777 in bridge.pending_photos  # 명령이라 보류 유지
+
+
+def test_pending_photo_kept_when_push_command(photo_env, tmp_path, monkeypatch):
+    # ⑥ push('ㅁ푸시해줘') 도 명령 → 보류 유지(push 블록이 오라클·보류소비 이전에 return).
+    monkeypatch.setattr(bridge, "do_push", lambda _root: bridge.HEADER_DONE)
+    bridge.pending_photos[777] = ("f", time.monotonic())
+    _fire(photo_env, _txt(777, "ㅁ푸시해줘"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert photo_env.runs == []
+    assert 777 in bridge.pending_photos
+
+
+def test_new_photo_replaces_pending(photo_env, tmp_path):
+    # ⑥ 새 사진(캡션 없음)이 또 오면 보류를 최신 것으로 교체.
+    _fire(
+        photo_env,
+        _photo(777, caption=None, photo_ref="first"),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    _fire(
+        photo_env,
+        _photo(777, caption=None, photo_ref="second"),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert bridge.pending_photos[777][0] == "second"  # 최신으로 교체
+
+
+def test_photo_with_caption_clears_pending(photo_env, tmp_path):
+    # ⑥ 사진+캡션 즉시 실행 시 기존 보류 제거(새 첨부가 곧 의도 → 혼선 방지).
+    (tmp_path / "trading_info").mkdir()
+    bridge.pending_photos[777] = ("old", time.monotonic())
+    _fire(
+        photo_env,
+        _photo(777, caption="바로 봐줘"),
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert 777 not in bridge.pending_photos  # 즉시 첨부가 보류를 대체
+    assert len(photo_env.runs) == 1  # 즉시 실행
+
+
+def test_pending_photo_isolated_per_channel(photo_env, tmp_path):
+    # ⑥ 채널 격리: 채널 777 보류 사진은 다른 채널(888)의 자유 지시로 소비되지 않는다.
+    (tmp_path / "trading_info").mkdir()
+    bridge.chat_selection[888] = "trading_info"  # 888 은 자체 프로젝트로 일반 실행
+    bridge.pending_photos[777] = ("f", time.monotonic())
+    # 같은 허용 user(777)가 다른 채널(888)에서 자유 지시 → 888 엔 보류 없어 사진 주입 없이 실행.
+    _fire(
+        photo_env,
+        _txt(777, "다른 채널 지시", channel_id=888),
+        allowed=_ALLOWED2,
+        repo_root=tmp_path,
+        target_root=str(tmp_path),
+    )
+    assert 777 in bridge.pending_photos  # 777 보류는 그대로(격리)
+    assert len(photo_env.runs) == 1
+    assert "x.jpg" not in photo_env.runs[0]["task"]  # 888 실행에 777 사진이 새지 않음
+    assert photo_env.fetched == []  # 777 보류는 다운로드도 안 됨
+
+
+def test_pending_photo_consume_download_fail_graceful(monkeypatch, tmp_path):
+    # ⑥ 보류 소비 시 다운로드 실패 → graceful 안내, 보류는 이미 pop 됨(재시도로 매달리지 않음).
+    (tmp_path / "trading_info").mkdir()
+    bridge.channel_sessions.clear()
+    bridge.chat_selection.clear()
+    bridge.pending_photos.clear()
+    bridge.chat_selection[777] = "trading_info"
+    fa = FakeAdapter(secrets=[], fetch=OSError("net down"))
+    monkeypatch.setattr(bridge, "run_claude_with_progress", lambda *_a, **_k: fa.runs.append(1))
+    bridge.pending_photos[777] = ("f", time.monotonic())
+    _fire(fa, _txt(777, "이거 봐줘"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert fa.runs == []  # 다운로드 실패 → 실행 없음
+    assert any("내려받지" in t for _c, t, _b in fa.sent)  # graceful 안내
+    assert 777 not in bridge.pending_photos  # 소비 시점 pop — 만료·실패 무관 비워짐
+
+
+def test_pending_photo_kept_when_cwd_unresolved(photo_env, tmp_path):
+    # ⑥ pop-전 게이트(debugger B): cwd 미해석 채널(선택 없음·project 없음)에서 보류 중 자유 지시 →
+    # 소비하지 않고 보류 유지. (구버전은 여기서 pop 후 _run_photo 가 조기반환해 ref 가 증발했다.)
+    (tmp_path / "trading_info").mkdir()
+    bridge.pending_photos[777] = ("f", time.monotonic())
+    _fire(photo_env, _txt(777, "이거 분석해줘"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert photo_env.runs == []  # 사진 실행 없음
+    assert photo_env.fetched == []  # 다운로드 없음
+    assert 777 in bridge.pending_photos  # 보류 유지(유실 방지)
+    assert photo_env.sent  # 프로젝트 선택 안내는 나감
+
+
+def test_pending_photo_consumed_after_selection(photo_env, tmp_path):
+    # ⑥ 위 게이트로 보류 유지된 사진이, 프로젝트 선택 뒤 '다음' 자유 지시에서 그때 소비(1회 실행).
+    (tmp_path / "trading_info").mkdir()
+    bridge.pending_photos[777] = ("f", time.monotonic())
+    _fire(photo_env, _txt(777, "이거 봐줘"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert photo_env.runs == []
+    assert 777 in bridge.pending_photos  # 선택 전이라 보류 유지
+    bridge.chat_selection[777] = "trading_info"  # 프로젝트 선택
+    _fire(photo_env, _txt(777, "MU 값 대조"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert len(photo_env.runs) == 1  # 선택 후 자유 지시가 소비
+    assert "x.jpg" in photo_env.runs[0]["task"]  # 보류 사진 주입
+    assert 777 not in bridge.pending_photos  # 소비로 해제
+
+
+def test_pending_photo_kept_when_selection_message(photo_env, tmp_path):
+    # ⑥ 파생 방지: cwd 가 해석되는 채널이라도 '프로젝트명 단독'(선택 메시지)은 캡션으로 오소비하지
+    # 않는다 — 정상 선택(chat_selection 이동·project_guide)되고 보류는 유지된다.
+    (tmp_path / "trading_info").mkdir()
+    (tmp_path / "etf_info").mkdir()
+    bridge.chat_selection[777] = "trading_info"  # 게이트의 cwd 조건은 통과(선택 있음)
+    bridge.pending_photos[777] = ("f", time.monotonic())
+    _fire(photo_env, _txt(777, "etf_info"), repo_root=tmp_path, target_root=str(tmp_path))
+    assert photo_env.runs == []  # 사진 소비·실행 없음
+    assert photo_env.fetched == []  # 다운로드 없음
+    assert 777 in bridge.pending_photos  # 보류 유지
+    assert bridge.chat_selection[777] == "etf_info"  # 정상 선택 이동
+    assert photo_env.sent  # project_guide 안내
 
 
 def test_photo_disallowed_user_never_downloads(tmp_path):
@@ -2752,6 +2917,7 @@ def test_handle_text_sends_note_when_ahead(monkeypatch, tmp_path):
 def sel_env(monkeypatch):
     """chat_selection 격리 + run_claude_with_progress·git 스파이. FakeAdapter 를 yield."""
     bridge.chat_selection.clear()
+    bridge.pending_photos.clear()  # 앞선 보류-유지 테스트가 남긴 사진이 텍스트로 오소비되지 않게
     fa = FakeAdapter(secrets=[])
 
     def fake_run(_a, cid, _hdr, _exe, proj_path, task, _to, *_args, **_kw):

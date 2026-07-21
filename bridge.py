@@ -66,6 +66,7 @@ _SESSION_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
 
 PROGRESS_THROTTLE_SEC = 2.5  # 진행 편집 최소 간격(rate-limit 보호) — 카데언스는 코어 소유(§2.2)
 PROGRESS_TAIL_LINES = 12  # 진행 메시지에 표시할 최근 이벤트 줄 수(도배 방지)
+PENDING_PHOTO_TTL_SEC = 300  # 캡션 없는 보류 사진 유효시간(5분) — 초과 소비 시도는 조용히 폐기
 NOTIFY_TICK_SEC = 25  # 알림 스케줄 주기 틱(§3.3 — poll 과 독립된 타이머 스레드)
 # 진행/알림 헤더 선두 이모지(§4.1). 코어가 헤더에 쓰고 DC 어댑터가 STATUS_LEADERS 를 import 해
 # 상태색(노랑)을 판정한다 — HEADER_* 와 동형 단일 소스(색 조용히 어긋남 방지). 여기서 바꾸면 끝.
@@ -236,6 +237,14 @@ chat_selection: dict[int, str] = {}
 # 재시작해도 이어진다. channel_id 키라 M-1 격리 유지. 값은 claude 발행 UUID 만 저장(사용자 입력 무).
 # ponytail: 직렬 워커(한 번에 하나)라 락 불필요 — chat_selection 과 동형.
 channel_sessions: dict[int, str] = {}
+
+# ⑥ 캡션 없는 사진 보류(사진 먼저 → 지시 나중) — channel_id -> (photo_ref, time.monotonic()).
+# 캡션 없는 사진이 오면 폐기하지 않고 여기 보류하고, 같은 채널의 다음 '자유 지시'(명령 아님)가
+# TTL(PENDING_PHOTO_TTL_SEC) 안에 오면 그 사진과 묶어 사진+캡션 흐름으로 실행한다
+# (_consume_pending_photo). 명령이면 보류 유지(TTL 자연 소멸), 새 사진은 최신으로 교체. 다운로드는
+# 보류 시점이 아니라 소비 시점에(fetch_file 재사용). ponytail: 직렬 워커라 락 불필요·in-memory
+# (재시작 시 유실 수용).
+pending_photos: dict[int, tuple[str, float]] = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1363,53 +1372,52 @@ def _run_with_session(
     return data
 
 
-def _handle_photo(
+def _resolve_photo_cwd(event: Event, target_root: str) -> str | None:
+    """이 채널에서 사진 실행 대상(cwd)을 해석한다 — 없으면 None(프로젝트 선택 필요).
+
+    _run_photo 실행 규칙과 _handle_text 의 보류-소비 게이트가 공유하는 단일 소스(중복 제거).
+    특수 채널(_GENERAL_ROLES)은 프로젝트 무관(cwd=루트), 그 외는 채널=프로젝트(event.project)
+    또는 chat 선택 프로젝트, 어느 것도 없으면 None(§1.4 텍스트 일반 실행과 동형 규칙).
+    """
+    if event.channel_role in _GENERAL_ROLES:
+        return target_root
+    name = chat_selection.get(event.channel_id)
+    if event.project and resolve_project(event.project, target_root) is not None:
+        name = event.project  # 채널=프로젝트 UX 가 chat 선택보다 우선
+    return resolve_project(name, target_root) if name else None
+
+
+def _run_photo(
     adapter: Adapter,
     event: Event,
+    photo_ref: str,
+    caption: str,
     *,
     claude_exe: str,
     target_root: str,
     timeout: int,
 ) -> None:
-    """사진 + 지시문 → 이미지를 로컬 임시파일로 내려받아 경로를 프롬프트에 주입하고 일반 실행.
-
-    "사진 올리고 자유 지시" — 캡션(지시문)이 있으면 어느 채널이든 텍스트 작업과 동일하게
-    _run_with_session(세션 연속성·full 화이트리스트)로 실행한다. Read 는 ALLOWED_TOOLS 에 있어
-    claude 가 주입된 경로를 열어 이미지를 본다("MU 캡처 우리 값과 대조해줘" 같은 지시면 claude 가
-    Read 로 판독해 처리). 캡션이 없으면 실행 없이 안내 1줄.
+    """사진(photo_ref) + 캡션(지시) → 이미지 다운로드·경로 주입·일반 실행. 즉시 첨부·보류 소비 공유.
 
     실행 대상(cwd) 해석은 텍스트 일반 실행과 동일 규칙 — 특수 채널(#간단처리·#데이터분석)은
     프로젝트 무관(cwd=루트), 그 외는 채널=프로젝트(event.project) 또는 chat 선택 프로젝트. 어느
-    것도 없으면 실행 없이 프로젝트 선택 안내.
+    것도 없으면 실행 없이 프로젝트 선택 안내. photo_ref/caption 은 인자로 받아, 즉시 첨부(캡션=
+    event.text)와 보류 소비(캡션=다음 텍스트·photo_ref=보류분)가 이 한 경로를 공유한다.
 
     보안: 호출 전 handle_event 가 허용목록 게이트를 통과시킨 뒤에만 진입한다. 다운로드는 어댑터
     fetch_file(CDN 화이트리스트·확장자·10MB·트래버설 잠금)만 신뢰하고, task·경로는 stdin 전용(C-1).
     실행 후 임시파일은 성공·실패 무관 삭제한다(L-1: 무한 누증 방지).
     """
     channel_id = event.channel_id
-    caption = event.text.strip() if event.text else ""
-    if not caption:
-        adapter.send(channel_id, "사진과 함께 지시를 적어 보내주세요.")
-        return
-    if event.photo_ref is None:
-        adapter.send(channel_id, "사진을 읽지 못했습니다.")
-        return
-
-    # 실행 대상(cwd) 해석 — _handle_text 일반 실행과 동일 규칙(중복 없이 최소 재현).
-    if event.channel_role in _GENERAL_ROLES:
-        proj_path: str | None = target_root
-    else:
-        name = chat_selection.get(channel_id)
-        if event.project and resolve_project(event.project, target_root) is not None:
-            name = event.project  # 채널=프로젝트 UX 가 chat 선택보다 우선(§1.4 텍스트와 동형)
-        proj_path = resolve_project(name, target_root) if name else None
+    # 실행 대상(cwd) 해석 — _resolve_photo_cwd 단일 소스(소비 게이트와 공유).
+    proj_path = _resolve_photo_cwd(event, target_root)
     if proj_path is None:
         adapter.send(channel_id, "먼저 프로젝트를 선택한 뒤 사진과 지시를 보내주세요.")
         return
 
     # 사진 다운로드(확장자·크기·경로 잠금은 어댑터 fetch_file). 실패는 graceful.
     try:
-        image = adapter.fetch_file(event.photo_ref, PHOTO_DIR)
+        image = adapter.fetch_file(photo_ref, PHOTO_DIR)
     except (
         urllib.error.URLError,
         OSError,
@@ -1441,6 +1449,78 @@ def _handle_photo(
         )
     finally:
         image.unlink(missing_ok=True)
+
+
+def _consume_pending_photo(channel_id: int) -> str | None:
+    """이 채널의 보류 사진을 꺼낸다 — TTL 안이면 photo_ref, 만료·없음이면 None(항상 정리·pop).
+
+    소비 시도 시점에 만료를 판정한다(만료 시 별도 알림 없이 조용히 폐기 — 사양 3). pop 이라
+    성공 소비도 만료 폐기도 보류를 비우고, 명령 경로는 이 함수를 호출하지 않아(위에서 return)
+    보류가 그대로 남는다.
+    """
+    entry = pending_photos.pop(channel_id, None)
+    if entry is None:
+        return None
+    ref, ts = entry
+    if time.monotonic() - ts > PENDING_PHOTO_TTL_SEC:
+        return None  # 만료 — 조용히 폐기
+    return ref
+
+
+def _is_selection_message(text: str, target_root: str) -> bool:
+    """텍스트가 '프로젝트 선택/이동' 단독 메시지인지 — 첫 단어가 프로젝트(폴더/한글 라벨)이고 뒤에
+    지시가 없을 때 True. 보류 소비 게이트가 이 경우 소비를 건너뛰어(선택 경로로 폴백) 선택 메시지를
+    캡션으로 오소비하지 않게 한다 — 선택 후 '다음' 자유 지시가 TTL 내에 사진을 소비한다.
+    """
+    parts = text.split(maxsplit=1)
+    if len(parts) != 1:  # 프로젝트명 뒤에 지시가 붙으면 '단독 선택' 아님 — 소비 대상
+        return False
+    first = parts[0]
+    if resolve_project(first, target_root) is not None:
+        return True
+    return any(lbl == first for lbl in PROJECT_LABELS.values())  # 한글 라벨(간단처리 이동)
+
+
+def _handle_photo(
+    adapter: Adapter,
+    event: Event,
+    *,
+    claude_exe: str,
+    target_root: str,
+    timeout: int,
+) -> None:
+    """사진 이벤트 처리 — 캡션 유무로 갈린다.
+
+    캡션(지시)이 있으면 어느 채널이든 이미지를 내려받아 경로를 프롬프트에 주입하고 일반 실행
+    (_run_photo). 캡션이 없으면 폐기하지 않고 채널별로 보류하고(pending_photos, 사진 먼저→지시
+    나중), 안내 1줄만 보낸다 — 다음 자유 지시가 이 보류를 소비한다(_handle_text). 새 사진은 최신으로
+    교체(dict 덮어쓰기). 사진+캡션이 즉시 오면 기존 보류를 제거한다 — 새 첨부가 곧 사용자 의도라
+    이전 보류를 이어가면 어느 사진인지 혼선이 커서(근거).
+
+    보안: 호출 전 handle_event 가 허용목록 게이트를 통과시킨 뒤에만 진입한다.
+    """
+    channel_id = event.channel_id
+    if event.photo_ref is None:  # 캡션 유무와 무관 — 사진 자체를 못 읽으면 여기서 끝(가드 단일화).
+        adapter.send(channel_id, "사진을 읽지 못했습니다.")
+        return
+    caption = event.text.strip() if event.text else ""
+    if not caption:
+        # 사진 먼저 → 지시 나중: 보류(최신으로 교체). 다운로드는 소비 시점에(fetch_file 재사용).
+        pending_photos[channel_id] = (event.photo_ref, time.monotonic())
+        log.info("chat=%s 사진 보류(지시 대기)", channel_id)
+        adapter.send(channel_id, "📷 사진을 받아뒀어요. 지시를 보내주세요(5분 내).")
+        return
+    # 사진+캡션 즉시 실행 — 이전 보류가 있으면 제거(혼선 방지, 위 docstring 근거).
+    pending_photos.pop(channel_id, None)
+    _run_photo(
+        adapter,
+        event,
+        event.photo_ref,
+        caption,
+        claude_exe=claude_exe,
+        target_root=target_root,
+        timeout=timeout,
+    )
 
 
 def _handle_button(
@@ -1747,6 +1827,36 @@ def _handle_text(
         log.info("chat=%s cmd=oracle", channel_id)
         adapter.send(channel_id, oracle_status_reply())
         return
+
+    # ⑥ 사진 보류 소비 — 캡션 없이 먼저 온 사진이 이 채널에 보류돼 있고, 지금 텍스트가 위 명령
+    # 분기(awaiting·음악·push·ㅁ명령·오라클)를 모두 통과한 '자유 지시'면 보류 사진과 묶어 사진+캡션
+    # 흐름으로 실행하고 보류를 해제한다(사진 먼저 → 지시 나중). 이 지점(명령 판정 뒤·일반 실행 앞)에
+    # 두는 이유: 명령이면 위에서 이미 return 돼 보류가 유지되고(TTL 자연 소멸), 자유 지시만 여기
+    # 도달한다 — 사양 "명령이면 유지, 자유 지시면 소비"를 위치로 자연 충족. 만료분은 조용히 폐기.
+    # pop 전 해석 게이트(debugger B): pop 을 실행 커밋과 분리하지 않는다. cwd 가 이 채널에서
+    # 해석되고(안 되면 _run_photo 가 조기 반환해 pop 된 ref 가 증발) 텍스트가 프로젝트 선택/이동
+    # 단독 메시지가 아닐 때만 소비한다. 둘 중 하나라도 아니면 pop 을 건너뛰어 보류를 유지하고 아래
+    # 일반 경로로 폴백한다 — 미해석 채널은 '프로젝트 선택' 안내를 받되 사진은 남고(유실 방지),
+    # 선택 단독 메시지는 정상 선택되고(오소비 방지) '다음' 자유 지시가 TTL 내 소비한다. (대안 A
+    # 비파괴 소비+재삽입 대비 회귀 표면이 작다 — pop 자체를 미루므로 재삽입 경로가 없다.)
+    if (
+        channel_id in pending_photos
+        and _resolve_photo_cwd(event, target_root) is not None
+        and not _is_selection_message(stripped, target_root)
+    ):
+        pending_ref = _consume_pending_photo(channel_id)  # 이제서야 pop(만료면 None·폐기)
+        if pending_ref is not None:
+            log.info("chat=%s ⑥ 보류 사진 소비", channel_id)
+            _run_photo(
+                adapter,
+                event,
+                pending_ref,
+                stripped,
+                claude_exe=claude_exe,
+                target_root=target_root,
+                timeout=timeout,
+            )
+            return
 
     # 특수 채널(#간단처리·#데이터-분석): 프로젝트 무관 일반 실행 — cwd=target_root·full tools(§4.4).
     # 프로젝트 접두·선택 고정 없이 메시지 전체를 지시로 실행. 인가·stdin·화이트리스트 불변.
@@ -2113,6 +2223,14 @@ def _selftest() -> None:
     assert music_action("ㅁ노래") == "play" and music_action("ㅁ정지") == "stop"
     assert music_action("ㅁ다음") == "skip" and music_action("노래 추천해줘") is None
     assert music_action("/노래") is None and music_action("노래") is None  # 슬래시·평문 폐기
+    # ⑥ 사진 보류 소비 — TTL 안이면 ref, 만료·없음이면 None(+정리·pop).
+    pending_photos.clear()
+    pending_photos[1] = ("ref", time.monotonic())
+    assert _consume_pending_photo(1) == "ref"  # TTL 안 → ref
+    assert _consume_pending_photo(1) is None  # 소비돼 비어 있음
+    pending_photos[2] = ("old", time.monotonic() - PENDING_PHOTO_TTL_SEC - 1)
+    assert _consume_pending_photo(2) is None and 2 not in pending_photos  # 만료 → 폐기·정리
+    pending_photos.clear()
     print("selftest ok")
 
 
