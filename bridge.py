@@ -77,10 +77,10 @@ NOTIFY_TICK_SEC = 25  # 알림 스케줄 주기 틱(§3.3 — poll 과 독립된
 LEAD_RUN = "🔄"  # 진행(모든 진행성 헤더 = "🔄 작업 중" 단일 문구: 실행·이어서·사진대조·예약점검)
 LEAD_NOTIFY = "⏰"  # 예약 알림/스누즈
 STATUS_LEADERS = (LEAD_RUN, LEAD_NOTIFY)
-# push 명령(정확 일치만 push 로 취급 — 부분매칭 금지). 개발자 지시로 '푸시해줘' 단일 통일
-# (2026-07-22). 공백접기 매칭이라 "푸시 해줘"도 커버. COMMANDS 에 포함시켜 parse_message 가
+# push 명령(정확 일치만 push 로 취급 — 부분매칭 금지). 접두 'ㅁ' 통일로 'ㅁ푸시해줘' 단일
+# (2026-07-22). 공백접기 매칭이라 "ㅁ 푸시 해줘"도 커버. COMMANDS 에 포함시켜 parse_message 가
 # 이를 프로젝트명으로 오해하지 않게 한다.
-PUSH_WORDS = frozenset({"푸시해줘"})
+PUSH_WORDS = frozenset({"ㅁ푸시해줘"})
 # '오라클…' 상태 조회어 — PUSH_WORDS 처럼 공백접기 단독 정확매칭. 문장("오라클 연결 안되면…")은
 # 미발동 → 일반 실행(startswith 오탐 방지). 짧은 조회 표현만.
 ORACLE_WORDS = frozenset(
@@ -102,10 +102,10 @@ ORACLE_WORDS = frozenset(
 # 음악 재생 명령 — 재생 자체는 플랫폼(디스코드 음성) 소관이라 코어는 명령 판정만 하고
 # adapter.play_music/stop_music/skip_music capability 로 위임한다(clear_channel 패턴).
 # PUSH_WORDS·ORACLE_WORDS 처럼 공백접기+casefold 단독 정확매칭 —
-# '/재생'·'/다음'·'/정지'만 발동(문장·평문은 미발동).
-MUSIC_PLAY_WORDS = frozenset({"/재생"})
-MUSIC_SKIP_WORDS = frozenset({"/다음"})
-MUSIC_STOP_WORDS = frozenset({"/정지"})
+# 'ㅁ노래'·'ㅁ다음'·'ㅁ정지'만 발동(문장·평문은 미발동). 접두는 개인용 한글 자판 1키 'ㅁ' 통일.
+MUSIC_PLAY_WORDS = frozenset({"ㅁ노래"})
+MUSIC_SKIP_WORDS = frozenset({"ㅁ다음"})
+MUSIC_STOP_WORDS = frozenset({"ㅁ정지"})
 
 
 def music_action(text: str) -> str | None:
@@ -120,33 +120,19 @@ def music_action(text: str) -> str | None:
     return None
 
 
-# 한글 명령 별칭(§4.8 모바일 우선) → 영어 정규. /즐겨찾기·/최근 은 1e(죽은 명령 금지 — 미추가).
+# 명령 접두 'ㅁ' 통일(개인용 — 한글 자판 1키). 슬래시('/help'·'/프로젝트')·접두 없는 평문
+# ('프로젝트'·'청소')은 명령이 아니다. 동의어만 별칭으로 두고 정규 ㅁ 토큰으로 접는다.
 COMMAND_ALIASES = {
-    "/도움말": "/help",
-    "/프로젝트": "/projects",
-    "/취소": "/cancel",
-    "/재시작": "/restart",
-    "/청소": "/clean",
-    "/새대화": "/new",
+    "ㅁ사용법": "ㅁ도움말",
+    "ㅁ리셋": "ㅁ새대화",
+    "ㅁ새로시작": "ㅁ새대화",
 }
-# 평문 별칭(슬래시 없이) — PUSH_WORDS 처럼 strip+casefold 단독 정확매칭. 문장 속 단어는 미발동
-# (routing 이 stripped 전체를 대조하므로 "취소 좀 해줘"·"프로젝트 알려줘"는 명령 아님).
-PLAIN_ALIASES = {
-    "프로젝트": "/projects",
-    "도움말": "/help",
-    "사용법": "/help",
-    "취소": "/cancel",
-    "재시작": "/restart",
-    "청소": "/clean",
-    "새대화": "/new",
-    "리셋": "/new",
-    "새로시작": "/new",
-}
-# 별칭(슬래시·평문)도 COMMANDS 에 넣어 parse_message 가 이들을 프로젝트명으로 오해하지 않게 한다.
+# 정규 ㅁ 명령 토큰(별칭 접힘 후 라우팅이 == 로 비교하는 값) + 동의어 + push.
+# COMMANDS 에 다 넣어 ① parse_message 가 프로젝트명으로 오해하지 않게 하고 ② help 폴백
+# (알 수 없는 ㅁ… → HELP)이 정규 명령을 오검출하지 않게 한다.
 COMMANDS = (
-    frozenset({"/help", "/start", "/projects", "/cancel", "/restart", "/clean", "/new"})
+    frozenset({"ㅁ도움말", "ㅁ프로젝트", "ㅁ취소", "ㅁ재시작", "ㅁ청소", "ㅁ새대화"})
     | frozenset(COMMAND_ALIASES)
-    | frozenset(PLAIN_ALIASES)
     | PUSH_WORDS
 )
 # 특수 채널 역할 중 "프로젝트 무관 일반 실행" 대상(§4.4). 데이터분석 한계 안내는 채널 토픽에 1회.
@@ -263,7 +249,7 @@ channel_sessions: dict[int, str] = {}
 def parse_message(text: str) -> tuple[str, str] | None:
     """ "<프로젝트> <지시>" → (project, task). 커맨드나 형식 불일치는 None."""
     stripped = text.strip()
-    if not stripped or stripped in COMMANDS or stripped.startswith("/"):
+    if not stripped or stripped in COMMANDS or stripped.startswith("ㅁ"):
         return None
     parts = stripped.split(maxsplit=1)
     if len(parts) < 2:
@@ -1189,37 +1175,33 @@ def _restart(adapter: Adapter, channel_id: int, user_id: int) -> None:
 # §4.8 목업 CASE6(폰 실측 반영): 섹션 제목 `## `(디스코드 큰 헤더), 명령어는 제목 다음 줄
 # `명령어 - …`, 부가 힌트는 `-# ` 서브텍스트(작은 회색)로 위계 분리. 한글 명령 주력·영어 별칭 병기.
 HELP_TEXT = (
-    "## 작업 실행\n"
-    "프로젝트를 고르고 자유롭게 지시하세요.\n"
+    "### 작업 실행\n"
     "`etf_info 오늘 데이터 정확도 로그 확인해줘`\n"
-    "-# 한 번 고르면 이후엔 지시만 보내도 그 프로젝트에서 실행됩니다.\n"
+    "-# 한 번 고르면 이후엔 지시만 보내도 그 프로젝트에서 이어집니다.\n"
     "\n"
-    "## 프로젝트 선택\n"
-    "명령어 - 프로젝트 · /프로젝트 · /projects\n"
-    "목록 버튼을 탭해 대상 프로젝트를 고정합니다.\n"
+    "### 프로젝트 선택 — ㅁ프로젝트\n"
+    "프로젝트 목록 버튼을 띄웁니다. 탭해서 이 채널의 작업 대상을 고정합니다.\n"
     "\n"
-    "## 커밋 반영\n"
-    "명령어 - 푸시해줘 (띄어쓰기 무관)\n"
-    "로컬 커밋을 원격 main 에 push 합니다(pull --rebase 후).\n"
+    "### 커밋 반영 — ㅁ푸시해줘 (띄어쓰기 무관)\n"
+    "그동안 쌓인 로컬 커밋을 원격 main 에 올립니다(pull --rebase 후 push).\n"
     "\n"
-    "## 사진 대조\n"
-    "토스 캡처를 캡션에 종목을 적어 보내면 우리 값과 대조합니다.\n"
-    "`사진 + 캡션: MU`\n"
+    "### 새 대화 — ㅁ새대화\n"
+    "이 채널의 이전 대화 맥락을 비우고 새 세션으로 다시 시작합니다.\n"
     "\n"
-    "## 새 대화\n"
-    "명령어 - 새대화 · 리셋 · 새로시작 · /새대화\n"
-    "이 채널의 대화 맥락을 비우고 새 세션으로 시작합니다.\n"
+    "### 선택 취소 — ㅁ취소\n"
+    "버튼 선택을 기다리는 중일 때 그 대기를 취소합니다.\n"
     "\n"
-    "## 선택 취소\n"
-    "명령어 - 취소 · /취소 · /cancel\n"
-    "대기 중인 선택 입력을 취소합니다.\n"
+    "### 채널 청소 — ㅁ청소\n"
+    "확인을 거친 뒤 이 채널의 메시지를 전부 지웁니다(되돌릴 수 없음).\n"
     "\n"
-    "## 채널 청소\n"
-    "명령어 - 청소 · /청소\n"
-    "확인 후 이 채널의 메시지를 전부 삭제합니다(되돌릴 수 없음).\n"
+    "### 재시작 — ㅁ재시작\n"
+    "브리지(봇)를 다시 켭니다. 코드 수정을 반영하거나 봇이 멈췄을 때 씁니다.\n"
     "\n"
-    "## 도움말\n"
-    "명령어 - 도움말 · 사용법 · /도움말 · /help"
+    "### 음악 — ㅁ노래\n"
+    "음성채널에 들어가 배경음악을 재생합니다. 정지 ㅁ정지 · 다음곡 ㅁ다음.\n"
+    "\n"
+    "### 오라클 상태 — 오라클\n"
+    "무료 서버(오라클 클라우드) 재고 잡이가 도는 중인지 현재 상태를 알려줍니다."
 )
 
 
@@ -1715,10 +1697,10 @@ def _handle_text(
     stripped = text.strip()
 
     # ③ 직접입력 대기: '✏️직접입력' 후 다음 텍스트는 그 세션 resume 입력으로 라우팅.
-    # 슬래시 명령(/cancel·/help·/projects 등)은 예외 — 아래 분기로 폴백해 정상 처리한다
-    # (push 별칭은 유효한 답일 수 있어 그대로 답으로 라우팅, 슬래시만 명령으로 뺀다).
+    # ㅁ 명령(ㅁ취소·ㅁ도움말·ㅁ프로젝트 등)은 예외 — 아래 분기로 폴백해 정상 처리한다
+    # (ㅁ 접두가 아닌 평문은 유효한 답일 수 있어 그대로 답으로 라우팅, ㅁ 명령만 뺀다).
     awaiting = _find_awaiting(channel_id, event.user_id)
-    if awaiting is not None and not stripped.startswith("/"):
+    if awaiting is not None and not stripped.startswith("ㅁ"):
         mid, entry = awaiting
         pending.pop(mid, None)
         session_id, proj = entry.get("session_id"), entry.get("project_path")
@@ -1738,8 +1720,8 @@ def _handle_text(
             )
         return
 
-    # 음악 재생 명령('/재생'·'/정지'·'/다음'). 별칭 해석 이전에 둬야 한다 — 아래 cmd 분기의
-    # `cmd.startswith("/") and cmd not in COMMANDS → HELP` 폴백으로 이 명령이 새는 것 방지.
+    # 음악 재생 명령('ㅁ노래'·'ㅁ정지'·'ㅁ다음'). 별칭 해석 이전에 둬야 한다 — 아래 cmd 분기의
+    # `cmd.startswith("ㅁ") and cmd not in COMMANDS → HELP` 폴백으로 이 명령이 새는 것 방지.
     # 재생은 디스코드 음성 소관 → adapter capability 로 위임(코어는 판정만, clear_channel 패턴).
     act = music_action(stripped)
     if act == "play":
@@ -1755,20 +1737,32 @@ def _handle_text(
         adapter.send(channel_id, adapter.skip_music(channel_id))
         return
 
-    # 한글 명령 별칭(§4.8)을 영어 정규로 접어 아래 분기가 한 경로만 알게 한다(별칭도 COMMANDS 소속).
-    # 슬래시 별칭은 원문 정확매칭, 평문 별칭은 PUSH_WORDS 처럼 casefold 단독매칭(문장은 미발동).
-    cmd = COMMAND_ALIASES.get(stripped) or PLAIN_ALIASES.get(stripped.casefold()) or stripped
-    if cmd in ("/help", "/start") or (cmd.startswith("/") and cmd not in COMMANDS):
-        log.info("chat=%s cmd=/help", channel_id)
+    # push('ㅁ푸시해줘'). 별칭 해석 이전에 둔다 — 공백접기 매칭('ㅁ 푸시 해줘')이 아래 help
+    # 폴백(`cmd.startswith("ㅁ") and cmd not in COMMANDS`)에 걸리는 것 방지(COMMANDS 는 붙여쓰기만).
+    # casefold: 폰 자동 대문자화도 흡수. parse_message/COMMANDS 는 원문 기준이라 문장 오탐엔 무영향.
+    if "".join(stripped.split()).casefold() in PUSH_WORDS:
+        log.info("chat=%s cmd=push", channel_id)
+        result = do_push(repo_root)
+        adapter.send(channel_id, result)
+        outcome = "완료" if result.startswith(HEADER_DONE) else "실패"
+        log.info("chat=%s push 결과=%s", channel_id, outcome)
+        return
+
+    # 명령 동의어(ㅁ사용법·ㅁ리셋 등)를 정규 ㅁ 토큰으로 접어 아래 분기가 한 경로만 알게 한다.
+    # 슬래시·평문은 명령이 아니라 접힘 대상도 아니다(그대로 흘러 프로젝트 실행 경로로 간다).
+    cmd = COMMAND_ALIASES.get(stripped) or stripped
+    if cmd == "ㅁ도움말" or (cmd.startswith("ㅁ") and cmd not in COMMANDS):
+        # ㅁ도움말·ㅁ사용법 + 알 수 없는 ㅁ… 명령의 폴백 = HELP.
+        log.info("chat=%s cmd=help", channel_id)
         adapter.send(channel_id, HELP_TEXT)
         return
-    if cmd == "/projects":
+    if cmd == "ㅁ프로젝트":
         # §4.3: 버튼이 곧 목록 — 헤더 텍스트 없이 버튼만(디스코드 V2 는 TextDisplay 로 흡수).
         names = list_projects(target_root)
-        log.info("chat=%s cmd=/projects count=%d", channel_id, len(names))
+        log.info("chat=%s cmd=projects count=%d", channel_id, len(names))
         adapter.send(channel_id, "", project_buttons(names))
         return
-    if cmd == "/cancel":
+    if cmd == "ㅁ취소":
         # ③ 이 chat + user 의 직접입력 대기만 해제(M-1: 같은 채널 남의 대기 안 건드림). 없으면 안내.
         cleared = [
             m
@@ -1783,13 +1777,13 @@ def _handle_text(
         note = "취소했습니다." if cleared else "취소할 작업이 없습니다."
         adapter.send(channel_id, note)
         return
-    if cmd == "/restart":
+    if cmd == "ㅁ재시작":
         # 자기수정 루프 완결: 회신 먼저 보내 사용자에게 재시작을 알린 뒤 프로세스 종료(런처 재기동).
         log.info("chat=%s cmd=restart", channel_id)
         adapter.send(channel_id, "♻️ 재시작합니다…")
         _restart(adapter, channel_id, event.user_id)
         return  # 도달하지 않음(_restart 가 exit) — 방어적
-    if cmd == "/clean":
+    if cmd == "ㅁ청소":
         # 파괴적: 바로 삭제하지 않고 확인 버튼을 거친다(clean:ok 탭 시 _handle_button 에서 실행).
         log.info("chat=%s cmd=clean 확인요청", channel_id)
         adapter.send(
@@ -1798,21 +1792,12 @@ def _handle_text(
             [Button("🧹 청소", "clean:ok", ""), Button("✖ 취소", "x", "")],
         )
         return
-    if cmd == "/new":
+    if cmd == "ㅁ새대화":
         # ⑤ 대화 세션 리셋 — 이 채널 세션을 버려 다음 메시지가 새(백지) 세션으로 시작하게 한다.
         channel_sessions.pop(channel_id, None)
         save_channel_sessions(CHANNEL_SESSIONS_FILE, channel_sessions)
         log.info("chat=%s cmd=new 세션 리셋", channel_id)
         adapter.send(channel_id, "🆕 새 대화를 시작합니다.")
-        return
-    # casefold: 폰 자동 대문자화("Push")도 인식. 내부 공백 접기: "푸시 해줘"·"푸시 해"도 push 로
-    # (PUSH_WORDS 는 붙여쓰기 유지). parse_message/COMMANDS 는 원문 기준이라 문장 오탐엔 무영향.
-    if "".join(stripped.split()).casefold() in PUSH_WORDS:
-        log.info("chat=%s cmd=push", channel_id)
-        result = do_push(repo_root)
-        adapter.send(channel_id, result)
-        outcome = "완료" if result.startswith(HEADER_DONE) else "실패"
-        log.info("chat=%s push 결과=%s", channel_id, outcome)
         return
 
     # '오라클…' — 재고 잡이는 GitHub Actions(oci_arm_grabber)로 이관됨. gh 로 실행목록을
@@ -2127,21 +2112,21 @@ def main() -> int:
 def _selftest() -> None:
     """순수 함수 스모크(보안 경계 = resolve_project 트래버설 거부). qa 의 pytest 와 별개."""
     assert parse_message("etf_info 정확도 확인") == ("etf_info", "정확도 확인")
-    assert parse_message("/help") is None
-    assert parse_message("push") is None
-    assert PUSH_WORDS <= COMMANDS  # 모든 별칭이 COMMANDS 에 포함
-    assert frozenset(PLAIN_ALIASES) <= COMMANDS  # 평문 별칭도 COMMANDS 소속(프로젝트 오인 방지)
-    assert "/restart" in COMMANDS and PLAIN_ALIASES["재시작"] == "/restart"  # 재시작 명령 등록
-    assert "/clean" in COMMANDS and PLAIN_ALIASES["청소"] == "/clean"  # 청소 명령 등록
-    assert COMMAND_ALIASES["/청소"] == "/clean"
-    assert "/new" in COMMANDS and PLAIN_ALIASES["새대화"] == "/new"  # ⑤ 새대화 리셋 명령 등록
-    assert PLAIN_ALIASES["리셋"] == "/new" and COMMAND_ALIASES["/새대화"] == "/new"
+    assert parse_message("ㅁ도움말") is None  # ㅁ 접두 = 명령 → 프로젝트 파싱 안 함
+    assert parse_message("/help") is None  # 슬래시는 이제 명령 아님(단어 1개라 파싱 None)
+    assert PUSH_WORDS <= COMMANDS  # push 도 COMMANDS 소속
+    assert frozenset(COMMAND_ALIASES) <= COMMANDS  # 동의어도 COMMANDS 소속(프로젝트 오인 방지)
+    # 정규 ㅁ 토큰이 전부 COMMANDS 에 등록(help 폴백이 오검출 안 하게).
+    assert {"ㅁ프로젝트", "ㅁ취소", "ㅁ재시작", "ㅁ청소", "ㅁ새대화", "ㅁ도움말"} <= COMMANDS
+    assert COMMAND_ALIASES["ㅁ사용법"] == "ㅁ도움말"  # 도움말 동의어
+    assert COMMAND_ALIASES["ㅁ리셋"] == "ㅁ새대화"  # ⑤ 새대화 동의어
+    assert COMMAND_ALIASES["ㅁ새로시작"] == "ㅁ새대화"
     # ⑤ 채널 세션 라운드트립 — int 키 복원·UUID 필터(손상 값 드롭).
     assert load_channel_sessions(PROJECT_DIR / "_nope_sessions.json") == {}
-    assert all(parse_message(w) is None for w in PUSH_WORDS)  # bare 별칭은 push 커맨드
-    assert parse_message("프로젝트 알려줘") == ("프로젝트", "알려줘")  # 문장은 명령 아님(2단어)
-    assert parse_message("기록해주고 푸시해줘") == ("기록해주고", "푸시해줘")  # 문장은 push 아님
-    assert frozenset({"푸시해줘"}) == PUSH_WORDS  # 단일 통일(2026-07-22)
+    assert all(parse_message(w) is None for w in PUSH_WORDS)  # push 커맨드는 프로젝트 아님
+    assert parse_message("프로젝트 알려줘") == ("프로젝트", "알려줘")  # 평문은 명령 아님(2단어)
+    assert parse_message("기록해주고 ㅁ푸시해줘") == ("기록해주고", "ㅁ푸시해줘")  # 문장 push아님
+    assert frozenset({"ㅁ푸시해줘"}) == PUSH_WORDS  # 접두 ㅁ 통일(2026-07-22)
     assert is_allowed(7, frozenset({7})) and not is_allowed(1, frozenset({7}))
     assert resolve_project("..", str(PROJECT_DIR)) is None
     assert resolve_project("a/b", str(PROJECT_DIR)) is None
@@ -2200,9 +2185,10 @@ def _selftest() -> None:
         _oc_now,
     )
     assert "약 63회 시도" in _oc_out and "1시간 3분째" in _oc_out
-    # 음악 명령 판정(순수) — play/stop/skip 단독매칭, 문장은 미발동.
-    assert music_action("/재생") == "play" and music_action("/정지") == "stop"
-    assert music_action("/다음") == "skip" and music_action("노래 추천해줘") is None
+    # 음악 명령 판정(순수) — play/stop/skip 단독매칭, 문장·평문·슬래시는 미발동.
+    assert music_action("ㅁ노래") == "play" and music_action("ㅁ정지") == "stop"
+    assert music_action("ㅁ다음") == "skip" and music_action("노래 추천해줘") is None
+    assert music_action("/노래") is None and music_action("노래") is None  # 슬래시·평문 폐기
     print("selftest ok")
 
 

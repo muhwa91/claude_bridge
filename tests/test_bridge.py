@@ -258,15 +258,16 @@ def test_parse_message_whitespace_only_is_none():
 
 
 def test_parse_message_push_command_is_none():
-    assert parse_message("push") is None
+    assert parse_message("ㅁ푸시해줘") is None  # ㅁ 접두 = 명령
 
 
 def test_parse_message_help_command_is_none():
-    assert parse_message("/help") is None
+    assert parse_message("ㅁ도움말") is None  # ㅁ 접두 = 명령
 
 
-def test_parse_message_projects_command_is_none():
-    assert parse_message("/projects") is None
+def test_parse_message_command_with_trailing_words_is_none():
+    # ㅁ 접두면 뒤에 말이 붙어도 프로젝트로 파싱하지 않는다(명령 우선).
+    assert parse_message("ㅁ프로젝트 어쩌구") is None
 
 
 # ---------------------------------------------------------------------------
@@ -284,14 +285,15 @@ def test_parse_message_push_aliases_are_none():
 
 
 def test_parse_message_sentence_with_push_word_still_parses():
-    assert parse_message("기록해주고 푸시해줘") == ("기록해주고", "푸시해줘")
+    assert parse_message("기록해주고 ㅁ푸시해줘") == ("기록해주고", "ㅁ푸시해줘")
 
 
 def test_push_words_exact_match_only():
-    # 개발자 지시(2026-07-22): '푸시해줘' 단일 통일. 옛 변형(push·푸시·푸쉬…)은 제거.
-    assert frozenset({"푸시해줘"}) == bridge.PUSH_WORDS
+    # 접두 ㅁ 통일(2026-07-22): 'ㅁ푸시해줘' 단일. 슬래시·평문(push·푸시해줘)은 명령 아님.
+    assert frozenset({"ㅁ푸시해줘"}) == bridge.PUSH_WORDS
     assert "push" not in bridge.PUSH_WORDS
-    assert "기록해주고 푸시해줘" not in bridge.PUSH_WORDS
+    assert "푸시해줘" not in bridge.PUSH_WORDS  # 접두 없는 평문은 폐기
+    assert "기록해주고 ㅁ푸시해줘" not in bridge.PUSH_WORDS
 
 
 def _fold(s):
@@ -299,16 +301,16 @@ def _fold(s):
 
 
 def test_push_word_inner_space_folded():
-    assert _fold("푸시 해줘") in bridge.PUSH_WORDS  # 공백접기로 "푸시 해줘"도 커버
-    assert _fold("기록해주고 푸시해줘") not in bridge.PUSH_WORDS
+    assert _fold("ㅁ 푸시 해줘") in bridge.PUSH_WORDS  # 공백접기로 "ㅁ 푸시 해줘"도 커버
+    assert _fold("기록해주고 ㅁ푸시해줘") not in bridge.PUSH_WORDS
 
 
 def test_push_inner_space_routes_to_do_push(monkeypatch, tmp_path):
-    # #2 배선: "푸시 해줘"(중간 공백)가 handle_event 텍스트 분기에서 do_push 로 라우팅되는지.
+    # #2 배선: "ㅁ 푸시 해줘"(중간 공백)가 handle_event 텍스트 분기에서 do_push 로 라우팅되는지.
     pushes = []
     monkeypatch.setattr(bridge, "do_push", lambda root: pushes.append(root) or bridge.HEADER_DONE)
     fa = FakeAdapter()
-    _fire(fa, _txt(777, "푸시 해줘"), repo_root=tmp_path, target_root=str(tmp_path))
+    _fire(fa, _txt(777, "ㅁ 푸시 해줘"), repo_root=tmp_path, target_root=str(tmp_path))
     assert len(pushes) == 1  # do_push 호출됨
     assert fa.sent  # 결과 회신
 
@@ -1047,21 +1049,22 @@ def test_new_callbacks_not_routed_in_handle_button_ack_only():
 
 
 # ---------------------------------------------------------------------------
-# §4.8 한글 명령 별칭(/프로젝트·/취소·/도움말) — 영어 정규로 접힘 / §4.3 /projects 버튼 목록
+# ㅁ 명령(ㅁ프로젝트·ㅁ취소·ㅁ도움말) — 접두 ㅁ 통일 / §4.3 ㅁ프로젝트 버튼 목록
 # ---------------------------------------------------------------------------
 
 
 def test_korean_help_alias_routes_to_help():
-    a = FakeAdapter()
-    _fire(a, _txt(777, "/도움말"), target_root="root")
-    assert a.sent and a.sent[0][1] == bridge.HELP_TEXT
+    for word in ("ㅁ도움말", "ㅁ사용법"):  # ㅁ사용법 = 도움말 동의어
+        a = FakeAdapter()
+        _fire(a, _txt(777, word), target_root="root")
+        assert a.sent and a.sent[0][1] == bridge.HELP_TEXT
 
 
 def test_korean_projects_alias_lists_buttons(tmp_path):
     (tmp_path / "etf_info").mkdir()
     (tmp_path / "trading_info").mkdir()
     a = FakeAdapter()
-    _fire(a, _txt(777, "/프로젝트"), target_root=str(tmp_path))
+    _fire(a, _txt(777, "ㅁ프로젝트"), target_root=str(tmp_path))
     _cid, body, buttons = a.sent[0]
     assert body == ""  # 헤더 텍스트 제거 — 버튼만(버튼이 곧 목록)
     assert {b.action for b in buttons} == {"p"}
@@ -1070,58 +1073,48 @@ def test_korean_projects_alias_lists_buttons(tmp_path):
 
 def test_korean_cancel_alias_clears_await(choice_env):
     bridge.pending[50] = _pending_entry(await_reply=True)
-    _fire(choice_env, _txt(777, "/취소"), target_root="root")
+    _fire(choice_env, _txt(777, "ㅁ취소"), target_root="root")
     assert 50 not in bridge.pending
     assert any("취소" in t for _c, t, _b in choice_env.sent)
 
 
 def test_korean_aliases_are_commands_not_projects():
-    # parse_message 가 별칭을 프로젝트명으로 오해하지 않음(COMMANDS 소속·슬래시 접두).
-    for alias in ("/프로젝트", "/취소", "/도움말"):
-        assert parse_message(alias) is None
-        assert alias in bridge.COMMANDS
+    # parse_message 가 명령을 프로젝트명으로 오해하지 않음(COMMANDS 소속·ㅁ 접두).
+    for cmd in ("ㅁ프로젝트", "ㅁ취소", "ㅁ도움말"):
+        assert parse_message(cmd) is None
+        assert cmd in bridge.COMMANDS
+
+
+def test_slash_and_bare_words_are_not_commands(tmp_path):
+    # 완전 통일 회귀 잠금: 슬래시('/프로젝트')·평문('프로젝트'·'도움말')은 이제 명령이 아니다.
+    # 명령 경로(HELP·빈 body 버튼목록)로 새지 않고, 프로젝트 해석 경로(못 찾음 안내)로 간다.
+    bridge.chat_selection.clear()
+    (tmp_path / "etf_info").mkdir()
+    for word in ("/프로젝트", "프로젝트", "/청소", "청소", "도움말", "/help"):
+        a = FakeAdapter()
+        _fire(a, _txt(777, word), target_root=str(tmp_path))
+        assert all(t != bridge.HELP_TEXT for _c, t, _b in a.sent)  # HELP 아님
+        assert all(t != "" for _c, t, _b in a.sent)  # ㅁ프로젝트(빈 body 버튼목록) 경로 아님
+        assert any("찾지 못" in t for _c, t, _b in a.sent)  # 프로젝트 해석 경로(못 찾음)
 
 
 def test_projects_header_empty_buttons_only(tmp_path):
     # §4.3: 헤더 텍스트 없이 버튼만(빈 body) — 이전 "대상 프로젝트 N"·"• 라벨" 텍스트 회귀 잠금.
     (tmp_path / "etf_info").mkdir()
     a = FakeAdapter()
-    _fire(a, _txt(777, "/projects"), target_root=str(tmp_path))
+    _fire(a, _txt(777, "ㅁ프로젝트"), target_root=str(tmp_path))
     body, buttons = a.sent[0][1], a.sent[0][2]
     assert body == ""
     assert [b.action for b in buttons] == ["p"]
 
 
 # ---------------------------------------------------------------------------
-# 평문 별칭(슬래시 없이) — PUSH_WORDS 패턴. 단독 정확매칭만, 문장 속 단어는 미발동
+# 평문·문장 오탐 가드 — 접두 없는 단어는 명령 아님(ㅁ 접두만 명령). await 중엔 답으로 라우팅
 # ---------------------------------------------------------------------------
 
 
-def test_plain_projects_alias_lists_buttons(tmp_path):
-    (tmp_path / "etf_info").mkdir()
-    a = FakeAdapter()
-    _fire(a, _txt(777, "프로젝트"), target_root=str(tmp_path))
-    body, buttons = a.sent[0][1], a.sent[0][2]
-    assert body == ""  # 헤더 텍스트 제거 — 버튼만
-    assert [b.action for b in buttons] == ["p"]
-
-
-def test_plain_help_aliases_route_to_help():
-    for word in ("도움말", "사용법"):
-        a = FakeAdapter()
-        _fire(a, _txt(777, word), target_root="root")
-        assert a.sent[0][1] == bridge.HELP_TEXT
-
-
-def test_plain_cancel_alias_routes_to_cancel_command(choice_env):
-    # await 없을 때 평문 '취소' → /cancel 커맨드 경로(취소 안내).
-    bridge.pending.clear()
-    _fire(choice_env, _txt(777, "취소"), target_root="root")
-    assert any("취소할 작업이 없습니다." in t for _c, t, _b in choice_env.sent)
-
-
 def test_plain_cancel_during_await_routes_as_answer(choice_env):
-    # push 별칭과 동일: await 중 비-슬래시 '취소'는 답으로 라우팅(취소는 /취소·/cancel).
+    # await 중 ㅁ 접두가 아닌 '취소'는 답으로 라우팅(취소 명령은 ㅁ취소).
     bridge.pending[50] = _pending_entry(await_reply=True)
     _fire(choice_env, _txt(777, "취소"), target_root="root")
     assert len(choice_env.resumes) == 1
@@ -1157,21 +1150,16 @@ def test_plain_cancel_in_sentence_not_command(tmp_path):
 
 
 def test_restart_aliases_registered():
-    assert "/restart" in bridge.COMMANDS
-    assert {"재시작", "/재시작"} <= bridge.COMMANDS
-    assert bridge.PLAIN_ALIASES["재시작"] == "/restart"
-    assert bridge.COMMAND_ALIASES["/재시작"] == "/restart"
+    assert "ㅁ재시작" in bridge.COMMANDS
 
 
 def test_restart_sends_notice_then_calls_restart(monkeypatch):
     calls = []
     monkeypatch.setattr(bridge, "_restart", lambda a, c, u: calls.append((a, c, u)))
-    for word in ("재시작", "/재시작", "/restart"):
-        a = FakeAdapter()
-        calls.clear()
-        _fire(a, _txt(777, word), target_root="root")
-        assert any("재시작" in t for _c, t, _b in a.sent)  # 회신 먼저(사용자 인지)
-        assert calls == [(a, 777, 777)]  # 그 뒤 _restart(어댑터·chat·user 전달)
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ재시작"), target_root="root")
+    assert any("재시작" in t for _c, t, _b in a.sent)  # 회신 먼저(사용자 인지)
+    assert calls == [(a, 777, 777)]  # 그 뒤 _restart(어댑터·chat·user 전달)
 
 
 def test_restart_disallowed_user_blocked(monkeypatch):
@@ -1179,7 +1167,7 @@ def test_restart_disallowed_user_blocked(monkeypatch):
     calls = []
     monkeypatch.setattr(bridge, "_restart", lambda a, *_: calls.append(a))
     a = FakeAdapter()
-    _fire(a, _txt(999, "재시작"), allowed=_ALLOWED, target_root="root")
+    _fire(a, _txt(999, "ㅁ재시작"), allowed=_ALLOWED, target_root="root")
     assert calls == [] and a.sent == []
 
 
@@ -1201,20 +1189,17 @@ def test_restart_in_sentence_not_command(monkeypatch, tmp_path):
 
 
 def test_clean_aliases_registered():
-    assert "/clean" in bridge.COMMANDS
-    assert bridge.PLAIN_ALIASES["청소"] == "/clean"
-    assert bridge.COMMAND_ALIASES["/청소"] == "/clean"
+    assert "ㅁ청소" in bridge.COMMANDS
 
 
 def test_clean_command_sends_confirm_buttons():
     # 파괴적 명령이라 바로 삭제하지 않고 [🧹 청소][✖ 취소] 확인 버튼을 발송.
-    for word in ("청소", "/청소", "/clean"):
-        a = FakeAdapter()
-        _fire(a, _txt(777, word), target_root="root")
-        cid, body, buttons = a.sent[0]
-        assert cid == 777 and "삭제" in body
-        assert [b.action for b in buttons] == ["clean:ok", "x"]
-        assert a.cleared == []  # 확인 전 — 아직 삭제 안 함
+    a = FakeAdapter()
+    _fire(a, _txt(777, "ㅁ청소"), target_root="root")
+    cid, body, buttons = a.sent[0]
+    assert cid == 777 and "삭제" in body
+    assert [b.action for b in buttons] == ["clean:ok", "x"]
+    assert a.cleared == []  # 확인 전 — 아직 삭제 안 함
 
 
 def test_clean_in_sentence_not_command(tmp_path):
@@ -1253,33 +1238,35 @@ def test_clean_ok_disallowed_user_blocked():
 
 
 # ---------------------------------------------------------------------------
-# 음악 재생('/재생'·'/정지'·'/다음') — music_action 판정(순수) + adapter capability 위임
+# 음악 재생('ㅁ노래'·'ㅁ정지'·'ㅁ다음') — music_action 판정(순수) + adapter capability 위임
 # ---------------------------------------------------------------------------
 
 
 def test_music_action_play_words():
-    assert bridge.music_action("/재생") == "play"
+    assert bridge.music_action("ㅁ노래") == "play"
 
 
 def test_music_action_stop_words():
-    assert bridge.music_action("/정지") == "stop"
+    assert bridge.music_action("ㅁ정지") == "stop"
 
 
 def test_music_action_skip_words():
-    assert bridge.music_action("/다음") == "skip"
+    assert bridge.music_action("ㅁ다음") == "skip"
 
 
 def test_music_action_sentence_not_command():
-    # 오탐 가드: 문장/평문은 명령 아님(슬래시 3종 단독 정확매칭만).
-    # 폐기된 옛 별칭(/노래·/그만·노래다음 등)도 더는 발동하지 않아야 한다(별칭 폐기 회귀).
+    # 오탐 가드: 문장/평문/슬래시는 명령 아님(ㅁ 3종 단독 정확매칭만).
+    # 폐기된 옛 슬래시·평문(/노래·노래·/정지 등)은 더는 발동하지 않아야 한다(접두 통일 회귀).
     for word in (
         "노래 추천해줘",
         "노래 가사 알려줘",
         "이 노래 뭐야",
         "/노래",
         "노래",
-        "/그만",
-        "그만",
+        "/정지",
+        "/다음",
+        "정지",
+        "다음",
         "노래다음",
         "다음곡",
     ):
@@ -1288,36 +1275,36 @@ def test_music_action_sentence_not_command():
 
 def test_music_play_delegates_to_adapter():
     a = FakeAdapter()
-    _fire(a, _txt(777, "/재생"), target_root="root")
+    _fire(a, _txt(777, "ㅁ노래"), target_root="root")
     assert a.music == [("play", 777, 777)]  # play_music(channel_id, user_id)
     assert a.sent == [(777, "▶️ 재생 시작", None)]  # 반환 문자열을 회신
 
 
 def test_music_stop_delegates_to_adapter():
     a = FakeAdapter()
-    _fire(a, _txt(777, "/정지"), target_root="root")
+    _fire(a, _txt(777, "ㅁ정지"), target_root="root")
     assert a.music == [("stop", 777)]
     assert a.sent == [(777, "⏹️ 정지", None)]
 
 
 def test_music_skip_delegates_to_adapter():
     a = FakeAdapter()
-    _fire(a, _txt(777, "/다음"), target_root="root")
+    _fire(a, _txt(777, "ㅁ다음"), target_root="root")
     assert a.music == [("skip", 777)]
     assert a.sent == [(777, "⏭️ 다음", None)]
 
 
 def test_music_disallowed_user_no_reply():
-    # 인가 게이트 회귀: 비허용 user 의 '/재생'은 무회신·미위임.
+    # 인가 게이트 회귀: 비허용 user 의 'ㅁ노래'는 무회신·미위임.
     a = FakeAdapter()
-    _fire(a, _txt(999, "/재생"), allowed=_ALLOWED, target_root="root")
+    _fire(a, _txt(999, "ㅁ노래"), allowed=_ALLOWED, target_root="root")
     assert a.music == [] and a.sent == []
 
 
 def test_music_command_not_help_fallthrough():
-    # '/재생'이 cmd.startswith('/')·not in COMMANDS → HELP 폴백으로 새지 않는지(삽입위치 회귀).
+    # 'ㅁ노래'가 cmd.startswith('ㅁ')·not in COMMANDS → HELP 폴백으로 새지 않는지(삽입위치 회귀).
     a = FakeAdapter()
-    _fire(a, _txt(777, "/재생"), target_root="root")
+    _fire(a, _txt(777, "ㅁ노래"), target_root="root")
     assert all(t != bridge.HELP_TEXT for _c, t, _b in a.sent)
 
 
@@ -1869,10 +1856,10 @@ def test_data_analysis_channel_runs_general(monkeypatch, tmp_path):
 
 
 def test_general_channel_commands_still_work(monkeypatch, tmp_path):
-    # 특수 채널에서도 명령(/help)은 정상 — role 분기는 free-form 실행에만.
+    # 특수 채널에서도 명령(ㅁ도움말)은 정상 — role 분기는 free-form 실행에만.
     runs = _spy_rcwp(monkeypatch)
     a = FakeAdapter()
-    ev = Event(kind="text", channel_id=100, user_id=777, text="/help", channel_role="간단처리")
+    ev = Event(kind="text", channel_id=100, user_id=777, text="ㅁ도움말", channel_role="간단처리")
     _fire(a, ev, target_root=str(tmp_path))
     assert runs == []  # 실행 아님
     assert a.sent[0][1] == bridge.HELP_TEXT
@@ -2541,18 +2528,19 @@ def test_await_reply_routes_text_to_resume(choice_env):
 
 def test_await_reply_cancel_clears(choice_env):
     bridge.pending[50] = _pending_entry(await_reply=True)
-    _fire(choice_env, _txt(777, "/cancel"), target_root="root")
+    _fire(choice_env, _txt(777, "ㅁ취소"), target_root="root")
     assert 50 not in bridge.pending
     assert choice_env.resumes == []
     assert any("취소" in t for _c, t, _b in choice_env.sent)
 
 
-def test_await_reply_slash_command_falls_through(choice_env, tmp_path):
+def test_await_reply_command_falls_through(choice_env, tmp_path):
+    # await 중 ㅁ 명령(ㅁ프로젝트)은 답으로 소비되지 않고 명령으로 폴백한다.
     (tmp_path / "etf_info").mkdir()
     bridge.pending[50] = _pending_entry(await_reply=True)
-    _fire(choice_env, _txt(777, "/projects"), target_root=str(tmp_path))
+    _fire(choice_env, _txt(777, "ㅁ프로젝트"), target_root=str(tmp_path))
     assert choice_env.resumes == []
-    # /projects 는 헤더 텍스트 없이 버튼만(§4.3 — 버튼이 곧 목록).
+    # ㅁ프로젝트 는 헤더 텍스트 없이 버튼만(§4.3 — 버튼이 곧 목록).
     assert any(b and all(x.action == "p" for x in b) for _c, _t, b in choice_env.sent)
     assert 50 in bridge.pending
 
@@ -2581,7 +2569,7 @@ def test_await_reply_other_chat_not_routed(choice_env):
 
 def test_cancel_other_chat_keeps_await(choice_env):
     bridge.pending[50] = _pending_entry(await_reply=True, chat_id=777)
-    _fire(choice_env, _txt(888, "/cancel"), allowed=_ALLOWED2, target_root="root")
+    _fire(choice_env, _txt(888, "ㅁ취소"), allowed=_ALLOWED2, target_root="root")
     assert 50 in bridge.pending
 
 
@@ -2632,11 +2620,11 @@ def test_cancel_same_channel_other_user_keeps_await(choice_env):
     bridge.pending[50] = _pending_entry(await_reply=True, chat_id=100, user_id=777)
     _fire(
         choice_env,
-        _txt(888, "/cancel", channel_id=100),
+        _txt(888, "ㅁ취소", channel_id=100),
         allowed=_ALLOWED2,
         target_root="root",
     )
-    assert 50 in bridge.pending  # 888 의 /cancel 은 777 의 대기를 해제 못 함
+    assert 50 in bridge.pending  # 888 의 ㅁ취소 는 777 의 대기를 해제 못 함
 
 
 # --- 핵심 배선 회귀 잠금: _render_choices / resume_run / run_claude_with_progress ---
@@ -3014,7 +3002,7 @@ def test_new_command_resets_session(monkeypatch, tmp_path):
     )
     assert bridge.channel_sessions[777] == "sid-aaa"
     reset_fa = FakeAdapter(secrets=[])
-    _fire(reset_fa, _txt(777, "새대화"), repo_root=tmp_path, target_root=root)
+    _fire(reset_fa, _txt(777, "ㅁ새대화"), repo_root=tmp_path, target_root=root)
     assert 777 not in bridge.channel_sessions  # 세션 초기화
     assert any("새 대화" in t for _c, t, _b in reset_fa.sent)
     assert len(calls) == 1  # 새대화는 claude 실행 아님

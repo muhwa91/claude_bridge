@@ -315,7 +315,7 @@ class DiscordAdapter:
         # edit 로 classic 전환을 막는다. 그래서 이 id 들은 edit 도 V2 로 유지한다(선택지 갱신·제거).
         # ponytail: 세션당 선택지/목록 수만큼 정수가 쌓이나(개인 봇·재시작 소멸) 무해 — 커지면 정리.
         self._v2_messages: set[int] = set()
-        # ── 음악 재생('/노래') 상태(디스코드 음성 capability, 이 어댑터에만) ──────────────
+        # ── 음악 재생('ㅁ노래') 상태(디스코드 음성 capability, 이 어댑터에만) ──────────────
         # 재생목록 URL 은 고정(.env MUSIC_PLAYLIST_URL). ffmpeg 는 imageio_ffmpeg 번들 실행파일.
         # 재생은 단일 길드·단일 음성연결이라 굵은 인스턴스 상태로 충분(봇 1대·동시 재생 1건).
         # ponytail: 단일 재생 세션 가정 — 다중 길드 동시재생이 필요해지면 길드별 상태 맵으로.
@@ -361,7 +361,7 @@ class DiscordAdapter:
         result = self._run(self._purge_coro(channel_id))
         return result if isinstance(result, int) else 0
 
-    # ── 음악 재생('/재생'·'/정지'·'/다음') capability(디스코드 음성) ──────────────
+    # ── 음악 재생('ㅁ노래'·'ㅁ정지'·'ㅁ다음') capability(디스코드 음성) ──────────────
     def play_music(self, channel_id: int, user_id: int) -> str:
         """호출자(user_id)가 있는 음성채널에서 고정 재생목록을 셔플·반복 재생. 회신 문자열 반환.
         _run 이 루프 미준비·예외를 삼켜 None 을 줄 수 있으므로 str 아니면 안내 폴백.
