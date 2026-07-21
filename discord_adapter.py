@@ -1000,7 +1000,11 @@ class DiscordAdapter:
             raise ValueError(f"허용되지 않은 확장자: {ext!r}")
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / name
-        req = urllib.request.Request(photo_ref)  # https + CDN 화이트리스트 통과분만(SSRF 차단)
+        # ⚠️ 함정 재발 방지: 디스코드 CDN(Cloudflare)은 urllib 기본 UA(Python-urllib/*)를 403 차단
+        # (작업일지 함정 "REST 직접 호출 시 User-Agent 필수"와 동일 — 라이브 실측 403→200 확인).
+        req = urllib.request.Request(  # https + CDN 화이트리스트 통과분만(SSRF 차단)
+            photo_ref, headers={"User-Agent": "Mozilla/5.0"}
+        )
         # M-3: 리다이렉트 차단 opener — CDN 이 3xx 로 내부주소를 가리켜도 추종 안 함(SSRF 차단).
         with _NOREDIRECT_OPENER.open(req, timeout=30) as resp:  # 스킴·호스트 검증됨
             clen = resp.headers.get("Content-Length")

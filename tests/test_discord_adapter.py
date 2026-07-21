@@ -116,6 +116,22 @@ def test_fetch_file_happy_writes_basename(monkeypatch, tmp_path):
     assert dest.read_bytes() == b"\x89PNGdata"
 
 
+def test_fetch_file_sends_user_agent(monkeypatch, tmp_path):
+    # 함정 회귀 방지: 디스코드 CDN(Cloudflare)은 기본 UA(Python-urllib/*)를 403 차단(2026-07-22
+    # 라이브 실측). Request 에 User-Agent 가 실려야 다운로드가 된다.
+    seen = []
+    _patch_urlopen(
+        monkeypatch, _FakeResp(b"x")
+    )  # 기본 패치 후 open 을 가로채 Request 캡처로 교체
+    monkeypatch.setattr(
+        discord_adapter._NOREDIRECT_OPENER,
+        "open",
+        lambda req, **_k: seen.append(req) or _FakeResp(b"x"),
+    )
+    _adapter().fetch_file(_CDN, tmp_path)
+    assert seen and seen[0].get_header("User-agent")  # urllib 은 헤더 키를 이 형태로 정규화
+
+
 def test_fetch_file_rejects_non_cdn_domain(monkeypatch, tmp_path):
     _patch_urlopen(monkeypatch, _FakeResp(b"x"))
     with pytest.raises(ValueError, match="도메인"):
